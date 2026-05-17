@@ -1,0 +1,38 @@
+#!/usr/bin/env zsh
+
+gum style \
+    --foreground 2 --border rounded --padding "1 2" \
+    "🚀 Git Push"
+
+# Verificar que estamos en un repo
+if ! git rev-parse --git-dir > /dev/null 2>&1; then
+    gum style --foreground 1 "✗ No estás en un repositorio git"
+    exit 1
+fi
+
+# Rama actual
+BRANCH=$(git branch --show-current)
+gum style --foreground 3 "🌿 Rama: $BRANCH"
+echo ""
+
+# Commits pendientes de pushear
+PENDING=$(git log @{u}..HEAD --oneline 2>/dev/null)
+
+if [ -z "$PENDING" ]; then
+    gum style --foreground 3 "⚠️  No hay commits pendientes de pushear"
+    exit 0
+fi
+
+gum style --foreground 6 "📌 Commits por pushear:"
+echo $PENDING | sed 's/^/  /'
+echo ""
+
+gum confirm "¿Hacer push a origin/$BRANCH?" || exit 0
+
+gum spin --spinner dot --title "Pusheando..." -- git push origin $BRANCH
+
+if [ $? -eq 0 ]; then
+    gum style --foreground 2 "✓ Push realizado a origin/$BRANCH"
+else
+    gum style --foreground 1 "✗ Error al hacer push"
+fi

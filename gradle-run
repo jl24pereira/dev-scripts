@@ -1,0 +1,43 @@
+#!/usr/bin/env zsh
+
+gum style \
+    --foreground 2 --border rounded --padding "1 2" \
+    "🐘 Gradle Runner"
+
+# Verificar que estamos en un proyecto Gradle
+if [ ! -f "build.gradle" ] && [ ! -f "build.gradle.kts" ]; then
+    gum style --foreground 1 "✗ No se encontró build.gradle en el directorio actual"
+    exit 1
+fi
+
+# Seleccionar task
+TASK=$(gum choose \
+    "build" \
+    "clean" \
+    "clean build" \
+    "bootRun" \
+    "test" \
+    "clean test" \
+    --header "🔧 Selecciona la task de Gradle")
+
+if [ -z "$TASK" ]; then
+    gum style --foreground 1 "✗ No seleccionaste ninguna task"
+    exit 0
+fi
+
+gum style --foreground 3 "⚙️  Ejecutando: gradle $TASK"
+echo ""
+
+# Ejecutar task
+if [ "$TASK" = "bootRun" ]; then
+    # bootRun no usa spinner porque es un proceso continuo
+    ./gradlew $TASK
+else
+    gum spin --spinner dot --title "Ejecutando gradle $TASK..." -- ./gradlew $TASK
+
+    if [ $? -eq 0 ]; then
+        gum style --foreground 2 "✓ gradle $TASK completado exitosamente"
+    else
+        gum style --foreground 1 "✗ gradle $TASK falló"
+    fi
+fi
