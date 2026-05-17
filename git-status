@@ -1,0 +1,89 @@
+#!/usr/bin/env zsh
+
+# Verificar que estamos en un repo
+if ! git rev-parse --git-dir > /dev/null 2>&1; then
+    gum style --foreground 1 "✗ No estás en un repositorio git"
+    exit 1
+fi
+
+gum style \
+    --foreground 2 --border rounded --padding "1 2" \
+    "📊 Git Status"
+
+# Rama actual
+BRANCH=$(git branch --show-current)
+
+# Estado respecto al remoto
+git fetch --quiet 2>/dev/null
+AHEAD=$(git rev-list @{u}..HEAD 2>/dev/null | wc -l | tr -d ' ')
+BEHIND=$(git rev-list HEAD..@{u} 2>/dev/null | wc -l | tr -d ' ')
+
+gum style --foreground 3 "🌿 Rama: $BRANCH"
+
+if [ "$AHEAD" -gt 0 ] && [ "$BEHIND" -gt 0 ]; then
+    gum style --foreground 1 "⚠️  $AHEAD adelante, $BEHIND atrás del remoto"
+elif [ "$AHEAD" -gt 0 ]; then
+    gum style --foreground 3 "⬆️  $AHEAD commit(s) por pushear"
+elif [ "$BEHIND" -gt 0 ]; then
+    gum style --foreground 1 "⬇️  $BEHIND commit(s) por pullear"
+else
+    gum style --foreground 2 "✓ Sincronizado con el remoto"
+fi
+
+echo ""
+
+# Último commit
+# Último commit
+gum style --foreground 6 "📌 Último commit:"
+LAST_HASH=$(git log -1 --pretty=format:"%h")
+LAST_MSG=$(git log -1 --pretty=format:"%s")
+LAST_DATE=$(git log -1 --pretty=format:"%ar")
+LAST_AUTHOR=$(git log -1 --pretty=format:"%an")
+echo "  $LAST_HASH $LAST_MSG ($LAST_DATE by $LAST_AUTHOR)"
+echo ""
+
+# Cuerpo del commit si existe
+BODY=$(git log -1 --pretty=format:"%b")
+if [ -n "$BODY" ]; then
+    gum style --foreground 8 "📄 Descripción:"
+    echo $BODY | sed 's/^/  /'
+    echo ""
+fi
+
+# Archivos modificados
+MODIFIED=$(git status --short | grep -E "^.M" | awk '{print $2}')
+ADDED=$(git status --short | grep -E "^\?\?" | awk '{print $2}')
+DELETED=$(git status --short | grep -E "^.D" | awk '{print $2}')
+STAGED=$(git status --short | grep -E "^[MADRC]" | awk '{print $2}')
+
+if [ -n "$STAGED" ]; then
+    gum style --foreground 2 "✅ En stage:"
+    echo $STAGED | tr ' ' '\n' | sed 's/^/  /'
+    echo ""
+fi
+
+if [ -n "$MODIFIED" ]; then
+    gum style --foreground 3 "✏️  Modificados:"
+    echo $MODIFIED | tr ' ' '\n' | sed 's/^/  /'
+    echo ""
+fi
+
+if [ -n "$ADDED" ]; then
+    gum style --foreground 4 "➕ Nuevos:"
+    echo $ADDED | tr ' ' '\n' | sed 's/^/  /'
+    echo ""
+fi
+
+if [ -n "$DELETED" ]; then
+    gum style --foreground 1 "🗑️  Eliminados:"
+    echo $DELETED | tr ' ' '\n' | sed 's/^/  /'
+    echo ""
+fi
+
+# Estadísticas
+STATS=$(git diff --cached --stat | tail -1)
+if [ -n "$STATS" ]; then
+    echo ""
+    gum style --foreground 6 "📈 Estadísticas en stage:"
+    echo $STATS | sed 's/^/  /'
+fi

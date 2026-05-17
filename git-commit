@@ -1,0 +1,52 @@
+#!/usr/bin/env zsh
+
+gum style \
+    --foreground 2 --border rounded --padding "1 2" \
+    "📝 Git Commit"
+
+# Verificar que estamos en un repo
+if ! git rev-parse --git-dir > /dev/null 2>&1; then
+    gum style --foreground 1 "✗ No estás en un repositorio git"
+    exit 1
+fi
+
+# Mostrar archivos modificados y seleccionar cuáles agregar
+FILES=$(git status --short | awk '{print $2}' | gum choose --no-limit --header "📁 Selecciona archivos para el commit")
+
+if [ -z "$FILES" ]; then
+    gum style --foreground 1 "✗ No seleccionaste archivos"
+    exit 1
+fi
+
+# Agregar archivos seleccionados
+echo $FILES | xargs git add
+
+# Tipo de commit
+TYPE=$(gum choose \
+    "feat" \
+    "fix" \
+    "docs" \
+    "refactor" \
+    "test" \
+    "chore" \
+    "style" \
+    --header "🏷️ Tipo de commit")
+
+# Mensaje principal
+MESSAGE=$(gum input --placeholder "Descripción corta del cambio" --header "💬 Mensaje principal")
+
+if [ -z "$MESSAGE" ]; then
+    gum style --foreground 1 "✗ El mensaje no puede estar vacío"
+    exit 1
+fi
+
+# Descripción adicional (opcional)
+gum style --foreground 3 "📄 Descripción adicional (opcional, Ctrl+D para terminar):"
+BODY=$(gum write --placeholder "Detalles adicionales del cambio...")
+
+# Construir commit
+if [ -z "$BODY" ]; then
+    COMMIT_MSG="$TYPE: $MESSAGE"
+else
+    COMMIT_MSG="$TYPE: $MESSAGE\n\n$BODY"
+fi
