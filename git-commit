@@ -40,13 +40,24 @@ if [ -z "$MESSAGE" ]; then
     exit 1
 fi
 
-# Descripción adicional (opcional)
-gum style --foreground 3 "📄 Descripción adicional (opcional, Ctrl+D para terminar):"
-BODY=$(gum write --placeholder "Detalles adicionales del cambio...")
+# Confirmar
+echo ""
+gum style --foreground 3 "Resumen:"
+echo "  Tipo:     $TYPE"
+echo "  Mensaje:  $MESSAGE"
+echo ""
 
-# Construir commit
+gum confirm "¿Hacer commit?" || exit 0
+
+# Hacer commit
 if [ -z "$BODY" ]; then
-    COMMIT_MSG="$TYPE: $MESSAGE"
+    git commit -m "$TYPE: $MESSAGE"
 else
-    COMMIT_MSG="$TYPE: $MESSAGE\n\n$BODY"
+    git commit -m "$TYPE: $MESSAGE" -m "$BODY"
+fi
+
+if [ $? -eq 0 ]; then
+    gum style --foreground 2 "✓ Commit realizado: $TYPE: $MESSAGE"
+else
+    gum style --foreground 1 "✗ Error al hacer el commit"
 fi
