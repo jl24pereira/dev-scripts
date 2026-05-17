@@ -40,6 +40,10 @@ if [ -z "$MESSAGE" ]; then
     exit 1
 fi
 
+# Descripción adicional (opcional)
+gum style --foreground 3 "📄 Descripción adicional (opcional, Ctrl+D para terminar):"
+BODY=$(gum write --placeholder "Detalles adicionales del cambio...")
+
 # Confirmar
 echo ""
 gum style --foreground 3 "Resumen:"
