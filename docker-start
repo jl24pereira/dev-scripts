@@ -1,0 +1,10 @@
+#!/usr/bin/env zsh
+
+if service docker status > /dev/null 2>&1; then
+    gum style --foreground 2 "✓ Docker ya está corriendo"
+else
+    gum spin --spinner dot --title "Iniciando Docker..." -- sudo service docker start
+    gum style --foreground 2 "✓ Docker iniciado"
+fi
+
+gum confirm "¿Abrir Lazydocker?" && lazydocker

@@ -1,0 +1,51 @@
+#!/usr/bin/env zsh
+
+gum style \
+    --foreground 2 --border rounded --padding "1 2" \
+    "🍃 Spring Boot Project Generator"
+
+# Datos del proyecto
+GROUP=$(gum input --placeholder "Group ID (ej: com.empresa)" --header "Group ID")
+ARTIFACT=$(gum input --placeholder "Nombre del proyecto (ej: mi-servicio)" --header "Artifact ID")
+DESCRIPTION=$(gum input --placeholder "Descripción del proyecto" --header "Descripción")
+
+# Tipo de build
+BUILD=$(gum choose "gradle-project" "maven-project" --header "🔧 Tipo de build")
+
+# Versión de Java
+JAVA=$(gum choose "21" "17" "11" --header "☕ Versión de Java")
+
+# Dependencias
+DEPS=$(spring init --list | grep -E "^\| [a-z]" | awk -F'|' '{print $2}' | sed 's/ //g' | gum filter --no-limit --header "📦 Dependencias (espacio para seleccionar, enter para confirmar)")
+
+# Convertir selección a formato csv
+DEPS_CSV=$(echo $DEPS | tr -s '\n' ',' | sed 's/.$//')
+
+# Confirmar
+echo ""
+gum style --foreground 3 "Resumen del proyecto:"
+echo "  Group:       $GROUP"
+echo "  Artifact:    $ARTIFACT"
+echo "  Build:       $BUILD"
+echo "  Java:        $JAVA"
+echo "  Deps:        $DEPS_CSV"
+echo ""
+
+gum confirm "¿Crear proyecto?" || exit 0
+
+# Crear proyecto
+gum spin --spinner dot --title "Creando proyecto..." -- \
+    spring init \
+        --group-id=$GROUP \
+        --artifact-id=$ARTIFACT \
+        --description="$DESCRIPTION" \
+        --type=$BUILD \
+        --java-version=$JAVA \
+        --dependencies=$DEPS_CSV \
+        --extract \
+        ~/projects/$ARTIFACT
+
+gum style --foreground 2 "✓ Proyecto creado en ~/projects/$ARTIFACT"
+
+# Abrir en Neovim
+gum confirm "¿Abrir en Neovim?" && cd ~/projects/$ARTIFACT && nvim .
