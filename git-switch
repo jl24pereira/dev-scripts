@@ -1,0 +1,53 @@
+#!/usr/bin/env zsh
+
+gum style \
+    --foreground 2 --border rounded --padding "1 2" \
+    "🌿 Git Switch"
+
+if ! git rev-parse --git-dir > /dev/null 2>&1; then
+    gum style --foreground 1 "✗ No estás en un repositorio git"
+    exit 1
+fi
+
+# Actualizar ramas remotas
+gum spin --spinner dot --title "Obteniendo ramas..." -- git fetch --all
+
+# Obtener ramas locales y remotas
+LOCAL=$(git branch | sed 's/\*//g' | sed 's/ //g')
+REMOTE=$(git branch -r | sed 's/origin\///g' | sed 's/ //g' | grep -v "HEAD")
+
+# Construir lista con indicadores
+LISTA=""
+ALL_BRANCHES=$(echo "$LOCAL\n$REMOTE" | sort -u)
+
+while IFS= read -r BRANCH; do
+    IS_LOCAL=$(echo $LOCAL | tr ' ' '\n' | grep -x "$BRANCH")
+    IS_REMOTE=$(echo $REMOTE | tr ' ' '\n' | grep -x "$BRANCH")
+
+    if [ -n "$IS_LOCAL" ] && [ -n "$IS_REMOTE" ]; then
+        LISTA="$LISTA$BRANCH [local+remota]\n"
+    elif [ -n "$IS_LOCAL" ]; then
+        LISTA="$LISTA$BRANCH [local]\n"
+    else
+        LISTA="$LISTA$BRANCH [remota]\n"
+    fi
+done <<< $(echo "$ALL_BRANCHES")
+
+# Seleccionar rama
+SELECTED=$(echo $LISTA | gum choose --header "🌿 Selecciona una rama")
+
+if [ -z "$SELECTED" ]; then
+    gum style --foreground 1 "✗ No seleccionaste ninguna rama"
+    exit 0
+fi
+
+# Extraer solo el nombre de la rama sin el indicador
+BRANCH=$(echo $SELECTED | awk '{print $1}')
+
+gum spin --spinner dot --title "Cambiando a $BRANCH..." -- git switch $BRANCH
+
+if [ $? -eq 0 ]; then
+    gum style --foreground 2 "✓ Cambiado a rama: $BRANCH"
+else
+    gum style --foreground 1 "✗ Error al cambiar de rama"
+fi

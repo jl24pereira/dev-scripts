@@ -4,10 +4,20 @@ gum style \
     --foreground 2 --border rounded --padding "1 2" \
     "🐘 Gradle Runner"
 
-# Verificar que estamos en un proyecto Gradle
-if [ ! -f "build.gradle" ] && [ ! -f "build.gradle.kts" ]; then
-    gum style --foreground 1 "✗ No se encontró build.gradle en el directorio actual"
+# Buscar build.gradle en el directorio actual o subdirectorios
+BUILD_FILE=$(find . -name "build.gradle" -o -name "build.gradle.kts" 2>/dev/null | head -1)
+
+if [ -z "$BUILD_FILE" ]; then
+    gum style --foreground 1 "✗ No se encontró build.gradle en el proyecto"
     exit 1
+fi
+
+# Dar permisos y definir comando
+if [ -f "./gradlew" ]; then
+    chmod +x ./gradlew
+    GRADLE_CMD="./gradlew"
+else
+    GRADLE_CMD="gradle"
 fi
 
 # Seleccionar task
@@ -28,16 +38,19 @@ fi
 gum style --foreground 3 "⚙️  Ejecutando: gradle $TASK"
 echo ""
 
-# Ejecutar task
+# Ejecutar task — pasar como array para manejar múltiples tasks
 if [ "$TASK" = "bootRun" ]; then
-    # bootRun no usa spinner porque es un proceso continuo
-    ./gradlew $TASK
+    $GRADLE_CMD ${=TASK}
 else
-    gum spin --spinner dot --title "Ejecutando gradle $TASK..." -- ./gradlew $TASK
+    $GRADLE_CMD ${=TASK} 2>&1 | tee /tmp/gradle-output.log
+    EXIT_CODE=${pipestatus[1]}
 
-    if [ $? -eq 0 ]; then
+    if [ $EXIT_CODE -eq 0 ]; then
         gum style --foreground 2 "✓ gradle $TASK completado exitosamente"
     else
         gum style --foreground 1 "✗ gradle $TASK falló"
     fi
+
+    echo ""
+    gum confirm "¿Ver logs completos?" && gum pager < /tmp/gradle-output.log
 fi
