@@ -28,6 +28,7 @@ TASK=$(gum choose \
     "bootRun" \
     "test" \
     "clean test" \
+    "sonar" \
     --header "🔧 Selecciona la task de Gradle")
 
 if [ -z "$TASK" ]; then
@@ -35,14 +36,26 @@ if [ -z "$TASK" ]; then
     exit 0
 fi
 
-gum style --foreground 3 "⚙️  Ejecutando: gradle $TASK"
+# Nombre dinamico del proyecto
+PROJECT_NAME=$(basename "$PWD")
+PROJECT_KEY="${PROJECT_NAME}_CI"
+PROJECT_VERSION="Local$(date +%d%m%Y).1"
+
+if [ "$TASK" = "sonar" ]; then
+    TASK_CMD="clean test sonar -Dsonar.host.url=${SONAR_HOST} -Dsonar.token=${SONAR_TOKEN} -Dsonar.branch.name=develop -Dsonar.projectKey=${PROJECT_KEY} -Dsonar.projectVersion=${PROJECT_VERSION}"
+else
+    TASK_CMD="$TASK"
+fi
+
+gum style --foreground 3 "⚙️  Ejecutando: gradle $TASK: $TASK_CMD"
 echo ""
+
 
 # Ejecutar task — pasar como array para manejar múltiples tasks
 if [ "$TASK" = "bootRun" ]; then
-    $GRADLE_CMD ${=TASK}
+    $GRADLE_CMD ${=TASK_CMD}
 else
-    $GRADLE_CMD ${=TASK} 2>&1 | tee /tmp/gradle-output.log
+    $GRADLE_CMD ${=TASK_CMD} 2>&1 | tee /tmp/gradle-output.log
     EXIT_CODE=${pipestatus[1]}
 
     if [ $EXIT_CODE -eq 0 ]; then
