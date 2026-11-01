@@ -1,0 +1,64 @@
+#!/usr/bin/env zsh
+
+gum style \
+    --foreground 2 --border rounded --padding "1 2" \
+    "🔀 Integrar Rama"
+
+if ! git rev-parse --git-dir > /dev/null 2>&1; then
+    gum style --foreground 1 "✗ No estás en un repositorio git"
+    exit 1
+fi
+
+SOURCE_BRANCH=$(git branch --show-current)
+
+TARGET_BRANCH=$(git branch \
+    | sed 's/\*//g' \
+    | sed 's/^ *//g' \
+    | grep -v "^$SOURCE_BRANCH$" \
+    | gum choose --header "Selecciona rama destino")
+
+if [ -z "$TARGET_BRANCH" ]; then
+    gum style --foreground 3 "⚠ Operación cancelada"
+    exit 0
+fi
+
+CONFIRM=$(gum confirm \
+    "¿Integrar '$SOURCE_BRANCH' en '$TARGET_BRANCH'?" \
+    && echo "si")
+
+if [ "$CONFIRM" != "si" ]; then
+    gum style --foreground 3 "⚠ Operación cancelada"
+    exit 0
+fi
+
+gum spin \
+    --spinner dot \
+    --title "Cambiando a $TARGET_BRANCH..." \
+    -- git switch "$TARGET_BRANCH"
+
+if [ $? -ne 0 ]; then
+    gum style --foreground 1 \
+        "✗ No fue posible cambiar de rama"
+    exit 1
+fi
+
+gum spin \
+    --spinner dot \
+    --title "Integrando cambios..." \
+    -- git merge "$SOURCE_BRANCH"
+
+if [ $? -ne 0 ]; then
+    gum style --foreground 1 \
+        "✗ El merge tuvo conflictos"
+    exit 1
+fi
+
+git branch -d "$SOURCE_BRANCH"
+
+gum style \
+    --foreground 2 \
+    "✓ Rama integrada"
+
+gum style \
+    --foreground 6 \
+    "🗑 Rama eliminada: $SOURCE_BRANCH"

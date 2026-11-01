@@ -1,0 +1,39 @@
+#!/usr/bin/env zsh
+
+gum style \
+    --foreground 2 --border rounded --padding "1 2" \
+    "🌿 Crear Rama"
+
+if ! git rev-parse --git-dir > /dev/null 2>&1; then
+    gum style --foreground 1 "✗ No estás en un repositorio git"
+    exit 1
+fi
+
+CURRENT_BRANCH=$(git branch --show-current)
+
+NEW_BRANCH=$(gum input \
+    --placeholder "Nombre de la nueva rama local")
+
+if [ -z "$NEW_BRANCH" ]; then
+    gum style --foreground 3 "⚠ Operación cancelada"
+    exit 0
+fi
+
+gum spin \
+    --spinner dot \
+    --title "Creando rama..." \
+    -- git switch -c "$NEW_BRANCH"
+
+if [ $? -eq 0 ]; then
+    gum style \
+        --foreground 2 \
+        "✓ Rama creada: $NEW_BRANCH"
+
+    gum style \
+        --foreground 6 \
+        "📍 Basada en: $CURRENT_BRANCH"
+else
+    gum style \
+        --foreground 1 \
+        "✗ No fue posible crear la rama"
+fi

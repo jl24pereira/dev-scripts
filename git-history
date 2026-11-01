@@ -1,0 +1,130 @@
+#!/usr/bin/env zsh
+
+gum style \
+    --foreground 4 --border rounded --padding "1 2" \
+    "📚 Git History"
+
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+    gum style --foreground 1 "✗ No estás en un repositorio git"
+    exit 1
+fi
+
+OPTION=$(gum choose \
+    "Historial general" \
+    "Historial de archivo" \
+    "Historial de directorio" \
+    "Ver commit" \
+    "Buscar texto" \
+    "Git blame" \
+    "Archivos modificados recientemente" \
+    "Commits de la rama actual")
+
+case "$OPTION" in
+
+    "Historial general")
+        git log \
+            --graph \
+            --decorate \
+            --oneline \
+            --all | less -R
+        ;;
+
+    "Historial de archivo")
+
+        FILE=$(find . -type f \
+            ! -path "*/.git/*" \
+            | sed 's|^\./||' \
+            | gum filter \
+                --placeholder "Selecciona un archivo")
+
+        [ -z "$FILE" ] && exit 0
+
+        git log \
+            --follow \
+            --stat \
+            -- "$FILE" | less
+        ;;
+
+    "Historial de directorio")
+
+        DIR=$(find . -type d \
+            ! -path "*/.git/*" \
+            | sed 's|^\./||' \
+            | gum filter \
+                --placeholder "Selecciona un directorio")
+
+        [ -z "$DIR" ] && exit 0
+
+        git log \
+            --stat \
+            -- "$DIR" | less
+        ;;
+
+    "Ver commit")
+
+        COMMIT=$(git log \
+            --oneline \
+            -n 100 \
+            | gum choose)
+
+        [ -z "$COMMIT" ] && exit 0
+
+        HASH=$(echo "$COMMIT" | awk '{print $1}')
+
+        git show "$HASH" | less
+        ;;
+
+    "Buscar texto")
+
+        TEXT=$(gum input \
+            --placeholder "Texto a buscar")
+
+        [ -z "$TEXT" ] && exit 0
+
+        git log \
+            -S "$TEXT" \
+            --oneline \
+            --decorate \
+            --all | less
+        ;;
+
+    "Git blame")
+
+        FILE=$(find . -type f \
+            ! -path "*/.git/*" \
+            | sed 's|^\./||' \
+            | gum filter \
+                --placeholder "Selecciona un archivo")
+
+        [ -z "$FILE" ] && exit 0
+
+        git blame "$FILE" | less
+        ;;
+
+    "Archivos modificados recientemente")
+
+        git log \
+            --name-only \
+            --pretty=format: \
+            -n 20 \
+            | grep -v '^$' \
+            | sort \
+            | uniq -c \
+            | sort -nr | less
+        ;;
+
+    "Commits de la rama actual")
+
+        CURRENT_BRANCH=$(git branch --show-current)
+
+        gum style \
+            --foreground 6 \
+            "🌿 Rama actual: $CURRENT_BRANCH"
+
+        git log \
+            --decorate \
+            --oneline \
+            -n 50 | less
+        ;;
+
+esac

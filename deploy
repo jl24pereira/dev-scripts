@@ -1,0 +1,200 @@
+#!/usr/bin/env zsh
+# ☁ Ambiente local: k3d (en lugar de EKS) + Floci (en lugar de AWS)
+#
+# Uso (desde la raíz de tu proyecto):
+#   dev            → menú interactivo
+#   dev deploy     → acción directa: up | deploy | apply | status | logs | forward | aws | pause | destroy
+#
+# Requiere: docker, k3d, kubectl, yq (mikefarah), gum, aws (perfil "floci")
+ 
+LOCAL_ENV=${0:A:h}
+PROJECT=$PWD
+K8S=$PROJECT/k8s
+VARS=$K8S/vars.yaml
+CLUSTER=${CLUSTER:-local}
+NETWORK=aws-local
+FLOCI_IP=172.18.0.10
+LOG=$(mktemp -t devenv.XXXXXX)
+trap 'rm -f $LOG' EXIT
+ 
+# ---------------------------------------------------------------- estilos
+ok()    { gum style --foreground 42  "✔ $*" }
+warn()  { gum style --foreground 214 "! $*" }
+err()   { gum style --foreground 196 "✘ $*" }
+title() { gum style --bold --foreground 212 "$*" }
+ 
+# Ejecuta un comando con spinner; si falla, muestra las últimas líneas del log.
+step() {
+  local msg=$1; shift
+  if gum spin --spinner dot --title "$msg..." -- zsh -c '"$@" >"$0" 2>&1' $LOG "$@"; then
+    ok $msg
+  else
+    err "$msg falló:"
+    tail -n 25 $LOG | gum style --foreground 245 --padding "0 2"
+    return 1
+  fi
+}
+ 
+check_tools() {
+  local missing=()
+  for t in docker k3d kubectl yq gum aws; do
+    (( $+commands[$t] )) || missing+=$t
+  done
+  (( ${#missing} == 0 )) || { err "Faltan herramientas: ${missing[*]}"; exit 1 }
+}
+ 
+# Lee los datos del bloque local de k8s/vars.yaml
+load_app() {
+  [[ -f $VARS ]] || { err "No encontré k8s/vars.yaml. Corre 'dev' desde la raíz de tu proyecto."; return 1 }
+  APP=$(yq '.local.appName' $VARS)
+  NS=$(yq '.local.namespace' $VARS)
+  PORT=$(yq '.local.containerPort' $VARS)
+  IMAGE="$(yq '.local.repository' $VARS):$(yq '.local.imageTag' $VARS)"
+  DEPLOY="deployment/$APP-deploy"
+}
+ 
+cluster_running() {
+  docker ps --format '{{.Names}}' | grep -q "^k3d-$CLUSTER-server-0$"
+}
+ 
+header() {
+  local cl fl app=""
+  cluster_running && cl="🟢 k3d" || cl="🔴 k3d"
+  docker ps --format '{{.Names}}' | grep -q '^floci$' && fl="🟢 Floci" || fl="🔴 Floci"
+  [[ -f $VARS ]] && app="  ·  📦 $(yq '.local.appName' $VARS) → ns $(yq '.local.namespace' $VARS)"
+  gum style --border rounded --border-foreground 212 --padding "0 2" --margin "1 0" \
+    "$(title '☁  Ambiente local')" "$cl   $fl$app"
+}
+ 
+# ---------------------------------------------------------------- acciones
+cmd_up() {
+  title "Levantando ambiente"
+  if ! docker network inspect $NETWORK >/dev/null 2>&1; then
+    step "Creando red $NETWORK" docker network create --subnet 172.18.0.0/16 --gateway 172.18.0.1 $NETWORK || return 1
+  fi
+ 
+  step "Levantando Floci" docker compose -f $LOCAL_ENV/compose.yaml up -d || return 1
+  step "Esperando a Floci" zsh -c 'for i in {1..30}; do curl -s localhost:4566 >/dev/null && exit 0; sleep 1; done; exit 1' || return 1
+ 
+  if k3d cluster list $CLUSTER >/dev/null 2>&1; then
+    cluster_running || step "Iniciando clúster $CLUSTER" k3d cluster start $CLUSTER || return 1
+  else
+    step "Creando clúster $CLUSTER" k3d cluster create $CLUSTER --network $NETWORK \
+      --k3s-arg "--disable=traefik@server:*" --wait || return 1
+  fi
+  kubectl config use-context k3d-$CLUSTER >/dev/null
+ 
+  kubectl get namespace local >/dev/null 2>&1 || step "Creando namespace local" kubectl create namespace local
+  step "Conectando clúster con Floci" kubectl apply -f $LOCAL_ENV/floci-service.yaml || return 1
+ 
+  ok "Listo · Floci: http://localhost:4566 · Floci UI: http://localhost:4500"
+}
+ 
+deploy() {   # $1 = build | nobuild
+  load_app || return 1
+  cluster_running || { err "El clúster no está corriendo. Usa 'Levantar ambiente' primero."; return 1 }
+  title "Desplegando $APP"
+ 
+  if [[ $1 == build ]]; then
+    if [[ -x $PROJECT/gradlew ]]; then
+      step "Compilando con Gradle" $PROJECT/gradlew -p $PROJECT build -x test || return 1
+    fi
+    step "Construyendo imagen $IMAGE" docker build -t $IMAGE $PROJECT || return 1
+    step "Importando imagen a k3d" k3d image import $IMAGE -c $CLUSTER || return 1
+  fi
+ 
+  step "Rellenando plantillas de k8s/" $LOCAL_ENV/render.sh $K8S local $PROJECT/.rendered/local || return 1
+ 
+  if ! kubectl get namespace $NS >/dev/null 2>&1; then
+    step "Creando namespace $NS" kubectl create namespace $NS
+    warn "Namespace nuevo: aplica floci-service.yaml en '$NS' para que la app vea a Floci"
+  fi
+ 
+  step "Aplicando manifiestos" kubectl apply -f $PROJECT/.rendered/local || return 1
+  [[ $1 == build ]] && { step "Reiniciando pod con la imagen nueva" kubectl rollout restart $DEPLOY -n $NS || return 1 }
+ 
+  if step "Esperando a que el pod quede listo" kubectl rollout status $DEPLOY -n $NS --timeout=300s; then
+    ok "$APP desplegado"
+  else
+    kubectl get pods -n $NS -l app=$APP
+    gum confirm "¿Ver los logs del pod?" && kubectl logs -n $NS -l app=$APP --tail=80
+    return 1
+  fi
+}
+cmd_deploy() { deploy build }
+cmd_apply()  { deploy nobuild }
+ 
+cmd_status() {
+  load_app || return 1
+  title "Estado de $APP"
+  kubectl get deploy,pods,svc,hpa -n $NS -l app=$APP 2>/dev/null || kubectl get all -n $NS
+  echo
+  kubectl get events -n $NS --sort-by=.lastTimestamp 2>/dev/null | tail -n 8
+}
+ 
+cmd_logs() {
+  load_app || return 1
+  title "Logs de $APP (Ctrl+C para salir)"
+  kubectl logs -f -n $NS -l app=$APP --all-containers --tail=100
+}
+ 
+cmd_forward() {
+  load_app || return 1
+  local lp=$(gum input --header "Puerto local" --value $PORT) || return
+  ok "http://localhost:$lp → $APP:$PORT   (Ctrl+C para cortar)"
+  kubectl port-forward -n $NS $DEPLOY $lp:$PORT
+}
+ 
+cmd_aws() {
+  title "Recursos en Floci"
+  local a="aws --profile floci --output text"
+  gum style --bold "SQS";             $a sqs list-queues --query 'QueueUrls[]' 2>/dev/null | tr '\t' '\n' | sed 's/^/  /'
+  gum style --bold "DynamoDB";        $a dynamodb list-tables --query 'TableNames[]' 2>/dev/null | tr '\t' '\n' | sed 's/^/  /'
+  gum style --bold "S3";              $a s3 ls 2>/dev/null | sed 's/^/  /'
+  gum style --bold "Secrets Manager"; $a secretsmanager list-secrets --query 'SecretList[].Name' 2>/dev/null | tr '\t' '\n' | sed 's/^/  /'
+  gum style --bold "Lambda";          $a lambda list-functions --query 'Functions[].FunctionName' 2>/dev/null | tr '\t' '\n' | sed 's/^/  /'
+  gum style --foreground 245 "Vista web: http://localhost:4500"
+}
+ 
+cmd_pause() {
+  title "Pausando ambiente (se conserva todo)"
+  step "Deteniendo clúster" k3d cluster stop $CLUSTER
+  step "Deteniendo Floci" docker compose -f $LOCAL_ENV/compose.yaml stop
+}
+ 
+cmd_destroy() {
+  gum confirm --default=false "¿Eliminar el clúster k3d? (Floci y sus datos se conservan)" || return 0
+  step "Eliminando clúster" k3d cluster delete $CLUSTER
+}
+ 
+# ---------------------------------------------------------------- entrada
+check_tools
+ 
+if [[ -n $1 ]]; then
+  (( $+functions[cmd_$1] )) || { err "Acción desconocida: $1"; exit 1 }
+  cmd_$1; exit $?
+fi
+ 
+typeset -A ACTIONS=(
+  "🚀 Levantar ambiente"            up
+  "📦 Compilar y desplegar app"     deploy
+  "📝 Aplicar solo manifiestos"     apply
+  "📊 Estado"                        status
+  "📜 Logs"                          logs
+  "🔌 Port-forward"                  forward
+  "☁  Ver recursos en Floci"        aws
+  "⏸  Pausar ambiente"              pause
+  "🗑  Eliminar clúster"             destroy
+)
+ORDER=("🚀 Levantar ambiente" "📦 Compilar y desplegar app" "📝 Aplicar solo manifiestos"
+       "📊 Estado" "📜 Logs" "🔌 Port-forward" "☁  Ver recursos en Floci"
+       "⏸  Pausar ambiente" "🗑  Eliminar clúster" "👋 Salir")
+ 
+while true; do
+  header
+  choice=$(gum choose --cursor "➜ " --height 12 $ORDER) || break
+  [[ $choice == "👋 Salir" ]] && break
+  cmd_${ACTIONS[$choice]}
+  echo; gum input --placeholder "Enter para volver al menú" >/dev/null || break
+  clear
+done
