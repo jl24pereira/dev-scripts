@@ -1,38 +1,57 @@
 #!/usr/bin/env zsh
+# 🚀 Push de la rama actual; publica ramas nuevas (-u) y ofrece salida si el remoto rechaza
+source ${0:A:h}/lib/ui.zsh
+require_repo
+banner "🚀 Git Push"
 
-gum style \
-    --foreground 2 --border rounded --padding "1 2" \
-    "🚀 Git Push"
-
-# Verificar que estamos en un repo
-if ! git rev-parse --git-dir > /dev/null 2>&1; then
-    gum style --foreground 1 "✗ No estás en un repositorio git"
-    exit 1
-fi
-
-# Rama actual
 BRANCH=$(git branch --show-current)
-gum style --foreground 3 "🌿 Rama: $BRANCH"
-echo ""
+[[ -n $BRANCH ]] || { err "Estás en detached HEAD"; exit 1 }
+REMOTE=${GIT_REMOTE:-origin}
+info "🌿 Rama: $BRANCH"
 
-# Commits pendientes de pushear
-PENDING=$(git log @{u}..HEAD --oneline 2>/dev/null)
-
-if [ -z "$PENDING" ]; then
-    gum style --foreground 3 "⚠️  No hay commits pendientes de pushear"
-    exit 0
-fi
-
-gum style --foreground 6 "📌 Commits por pushear:"
-echo $PENDING | sed 's/^/  /'
-echo ""
-
-gum confirm "¿Hacer push a origin/$BRANCH?" || exit 0
-
-gum spin --spinner dot --title "Pusheando..." -- git push origin $BRANCH
-
-if [ $? -eq 0 ]; then
-    gum style --foreground 2 "✓ Push realizado a origin/$BRANCH"
+if has_upstream; then
+  PENDING=$(git log --oneline '@{u}..HEAD')
+  [[ -n $PENDING ]] || { ok "No hay commits pendientes de pushear"; exit 0 }
+  UPSTREAM_FLAG=()
 else
-    gum style --foreground 1 "✗ Error al hacer push"
+  PENDING=$(git log --oneline -n 30 HEAD --not --remotes)
+  warn "La rama aún no existe en $REMOTE: se publicará con seguimiento (-u)"
+  UPSTREAM_FLAG=(-u)
 fi
+echo
+
+if [[ -n $PENDING ]]; then
+  info "📌 Commits por pushear:"
+  print -r -- $PENDING | sed 's/^/  /'
+  echo
+fi
+
+if [[ $BRANCH == (main|master|develop|release/*) ]]; then
+  gum confirm --default=false "⚠ Vas a pushear directo a $BRANCH. ¿Seguro?" || cancel
+else
+  gum confirm "¿Hacer push a $REMOTE/$BRANCH?" || cancel
+fi
+
+push() {
+  if run "Pusheando" git push "$@" $UPSTREAM_FLAG $REMOTE $BRANCH; then
+    ok "Push realizado a $REMOTE/$BRANCH"
+    # GitHub / Azure DevOps sugieren el enlace para crear el PR
+    grep -oE 'https?://[^ ]+' $UI_LOG | grep -Ei 'pull|pullrequest' | head -1 | sed 's/^/🔗 PR: /'
+    return 0
+  fi
+  return 1
+}
+
+push && exit 0
+grep -qE 'rejected|non-fast-forward|fetch first' $UI_LOG || exit 1
+
+ACTION=$(gum choose --header "El remoto tiene commits que no tienes" \
+  "Pull con rebase y reintentar" "Forzar con --force-with-lease" "Cancelar") || cancel
+case $ACTION in
+  Pull*)   run "Rebase sobre $REMOTE/$BRANCH" git pull --rebase $REMOTE $BRANCH \
+             || { err "Resuelve conflictos y luego: git rebase --continue (o --abort)"; exit 1 }
+           push ;;
+  Forzar*) gum confirm --default=false "Esto reescribe $REMOTE/$BRANCH. ¿Seguro?" && push --force-with-lease ;;
+  *)       cancel ;;
+esac
+

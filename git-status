@@ -1,89 +1,65 @@
 #!/usr/bin/env zsh
+# 📊 Estado del repo: rama, sincronía con el remoto, último commit y archivos por estado
+source ${0:A:h}/lib/ui.zsh
+require_repo
+banner "📊 Git Status"
 
-# Verificar que estamos en un repo
-if ! git rev-parse --git-dir > /dev/null 2>&1; then
-    gum style --foreground 1 "✗ No estás en un repositorio git"
-    exit 1
-fi
+quick_fetch
 
-gum style \
-    --foreground 2 --border rounded --padding "1 2" \
-    "📊 Git Status"
-
-# Rama actual
 BRANCH=$(git branch --show-current)
+[[ -z $BRANCH ]] && BRANCH="(detached en $(git rev-parse --short HEAD))"
+info "🌿 Rama: $BRANCH"
 
-# Estado respecto al remoto
-git fetch --quiet 2>/dev/null
-AHEAD=$(git rev-list @{u}..HEAD 2>/dev/null | wc -l | tr -d ' ')
-BEHIND=$(git rev-list HEAD..@{u} 2>/dev/null | wc -l | tr -d ' ')
-
-gum style --foreground 3 "🌿 Rama: $BRANCH"
-
-if [ "$AHEAD" -gt 0 ] && [ "$BEHIND" -gt 0 ]; then
-    gum style --foreground 1 "⚠️  $AHEAD adelante, $BEHIND atrás del remoto"
-elif [ "$AHEAD" -gt 0 ]; then
-    gum style --foreground 3 "⬆️  $AHEAD commit(s) por pushear"
-elif [ "$BEHIND" -gt 0 ]; then
-    gum style --foreground 1 "⬇️  $BEHIND commit(s) por pullear"
+if has_upstream; then
+  read BEHIND AHEAD < <(git rev-list --left-right --count '@{u}...HEAD')
+  if (( AHEAD && BEHIND )); then gum style --foreground 1 "⚠ $AHEAD adelante, $BEHIND atrás de $(git rev-parse --abbrev-ref '@{u}')"
+  elif (( AHEAD ));         then gum style --foreground 3 "⬆ $AHEAD commit(s) por pushear"
+  elif (( BEHIND ));        then gum style --foreground 1 "⬇ $BEHIND commit(s) por pullear"
+  else ok "Sincronizado con $(git rev-parse --abbrev-ref '@{u}')"
+  fi
 else
-    gum style --foreground 2 "✓ Sincronizado con el remoto"
+  warn "La rama no está publicada en el remoto (git-push la publica)"
+fi
+STASHES=$(git stash list | wc -l)
+(( STASHES )) && dim "📦 $STASHES stash(es) guardado(s)"
+echo
+
+if git rev-parse -q --verify HEAD >/dev/null; then
+  info "📌 Último commit:"
+  git --no-pager log -1 --color=always --format='  %C(yellow)%h%C(reset) %s %C(dim)(%ar · %an)%C(reset)'
+  BODY=$(git log -1 --format=%b)
+  [[ -n $BODY ]] && print -r -- $BODY | sed 's/^/    /'
+  echo
 fi
 
-echo ""
+# Archivos por estado (porcelain: XY ruta; respeta espacios y renombrados)
+local -a staged modified deleted untracked conflicts
+local line xy f
+for line in ${(f)"$(git status --porcelain)"}; do
+  xy=${line[1,2]} f=${line[4,-1]}
+  if [[ $xy == '??' ]]; then untracked+=$f
+  elif [[ $xy == *U* || $xy == (AA|DD) ]]; then conflicts+=$f
+  else
+    [[ ${xy[1]} != ' ' ]] && staged+="${xy[1]} $f"
+    [[ ${xy[2]} == M ]] && modified+=$f
+    [[ ${xy[2]} == D ]] && deleted+=$f
+  fi
+done
 
-# Último commit
-# Último commit
-gum style --foreground 6 "📌 Último commit:"
-LAST_HASH=$(git log -1 --pretty=format:"%h")
-LAST_MSG=$(git log -1 --pretty=format:"%s")
-LAST_DATE=$(git log -1 --pretty=format:"%ar")
-LAST_AUTHOR=$(git log -1 --pretty=format:"%an")
-echo "  $LAST_HASH $LAST_MSG ($LAST_DATE by $LAST_AUTHOR)"
-echo ""
+show() {  # color etiqueta archivos...
+  local color=$1 label=$2; shift 2
+  (( $# )) || return 0
+  gum style --foreground $color "$label ($#)"
+  print -rl -- "  "${^@}
+  echo
+}
+show 1 "💥 En conflicto" $conflicts
+show 2 "✅ En stage"     $staged
+show 3 "✏  Modificados"  $modified
+show 1 "🗑  Eliminados"   $deleted
+show 4 "➕ Nuevos"        $untracked
 
-# Cuerpo del commit si existe
-BODY=$(git log -1 --pretty=format:"%b")
-if [ -n "$BODY" ]; then
-    gum style --foreground 8 "📄 Descripción:"
-    echo $BODY | sed 's/^/  /'
-    echo ""
-fi
+(( $#staged + $#modified + $#deleted + $#untracked + $#conflicts )) || ok "Árbol de trabajo limpio"
+STATS=$(git diff --cached --shortstat)
+[[ -n $STATS ]] && info "📈 En stage:$STATS"
 
-# Archivos modificados
-MODIFIED=$(git status --short | grep -E "^.M" | awk '{print $2}')
-ADDED=$(git status --short | grep -E "^\?\?" | awk '{print $2}')
-DELETED=$(git status --short | grep -E "^.D" | awk '{print $2}')
-STAGED=$(git status --short | grep -E "^[MADRC]" | awk '{print $2}')
-
-if [ -n "$STAGED" ]; then
-    gum style --foreground 2 "✅ En stage:"
-    echo $STAGED | tr ' ' '\n' | sed 's/^/  /'
-    echo ""
-fi
-
-if [ -n "$MODIFIED" ]; then
-    gum style --foreground 3 "✏️  Modificados:"
-    echo $MODIFIED | tr ' ' '\n' | sed 's/^/  /'
-    echo ""
-fi
-
-if [ -n "$ADDED" ]; then
-    gum style --foreground 4 "➕ Nuevos:"
-    echo $ADDED | tr ' ' '\n' | sed 's/^/  /'
-    echo ""
-fi
-
-if [ -n "$DELETED" ]; then
-    gum style --foreground 1 "🗑️  Eliminados:"
-    echo $DELETED | tr ' ' '\n' | sed 's/^/  /'
-    echo ""
-fi
-
-# Estadísticas
-STATS=$(git diff --cached --stat | tail -1)
-if [ -n "$STATS" ]; then
-    echo ""
-    gum style --foreground 6 "📈 Estadísticas en stage:"
-    echo $STATS | sed 's/^/  /'
-fi

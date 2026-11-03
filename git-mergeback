@@ -1,64 +1,45 @@
 #!/usr/bin/env zsh
+# 🔀 Integra la rama actual en otra (local): actualiza destino, merge sin editor, maneja conflictos
+source ${0:A:h}/lib/ui.zsh
+require_repo
+banner "🔀 Integrar Rama"
 
-gum style \
-    --foreground 2 --border rounded --padding "1 2" \
-    "🔀 Integrar Rama"
+SOURCE=$(git branch --show-current)
+[[ -n $SOURCE ]] || { err "Estás en detached HEAD"; exit 1 }
+is_dirty && { err "Tienes cambios sin commit. Haz commit o stash primero."; exit 1 }
 
-if ! git rev-parse --git-dir > /dev/null 2>&1; then
-    gum style --foreground 1 "✗ No estás en un repositorio git"
-    exit 1
+BASE=$(base_branch)
+local -a targets=(${(f)"$(git for-each-ref --sort=-committerdate --format='%(refname:short)' refs/heads | grep -vx -- $SOURCE)"})
+(( $#targets )) || { err "No hay otras ramas locales"; exit 1 }
+# la rama base primero
+(( ${targets[(Ie)$BASE]} )) && targets=($BASE ${targets:#$BASE})
+TARGET=$(print -rl -- $targets | gum filter --header "Integrar '$SOURCE' en...") || cancel
+
+quick_fetch
+COMMITS=$(git log --oneline $TARGET..$SOURCE)
+[[ -n $COMMITS ]] || { ok "'$TARGET' ya contiene todo lo de '$SOURCE'"; exit 0 }
+info "📌 Commits que se integran:"; print -r -- $COMMITS | sed 's/^/  /'; echo
+
+gum confirm "¿Integrar '$SOURCE' en '$TARGET'?" || cancel
+
+run "Cambiando a $TARGET" git switch $TARGET || exit 1
+if has_upstream; then
+  run "Actualizando $TARGET" git pull --ff-only || {
+    err "$TARGET divergió de su remoto; resuélvelo antes de integrar."
+    git switch -q $SOURCE; exit 1 }
 fi
 
-SOURCE_BRANCH=$(git branch --show-current)
-
-TARGET_BRANCH=$(git branch \
-    | sed 's/\*//g' \
-    | sed 's/^ *//g' \
-    | grep -v "^$SOURCE_BRANCH$" \
-    | gum choose --header "Selecciona rama destino")
-
-if [ -z "$TARGET_BRANCH" ]; then
-    gum style --foreground 3 "⚠ Operación cancelada"
-    exit 0
+if ! run "Integrando $SOURCE" git merge --no-edit $SOURCE; then
+  CONFLICTS=$(git diff --name-only --diff-filter=U)
+  if [[ -n $CONFLICTS ]]; then
+    err "Conflictos en:"; print -r -- $CONFLICTS | sed 's/^/  /'
+    info "Resuélvelos y haz 'git commit', o cancela con 'git merge --abort'."
+  fi
+  exit 1
 fi
+ok "'$SOURCE' integrada en '$TARGET'"
 
-CONFIRM=$(gum confirm \
-    "¿Integrar '$SOURCE_BRANCH' en '$TARGET_BRANCH'?" \
-    && echo "si")
+has_upstream && gum confirm "¿Push de $TARGET?" && run "Pusheando $TARGET" git push && ok "Push realizado"
+gum confirm --default=false "¿Eliminar la rama local '$SOURCE'?" && git branch -d $SOURCE && ok "Rama eliminada: $SOURCE"
+exit 0
 
-if [ "$CONFIRM" != "si" ]; then
-    gum style --foreground 3 "⚠ Operación cancelada"
-    exit 0
-fi
-
-gum spin \
-    --spinner dot \
-    --title "Cambiando a $TARGET_BRANCH..." \
-    -- git switch "$TARGET_BRANCH"
-
-if [ $? -ne 0 ]; then
-    gum style --foreground 1 \
-        "✗ No fue posible cambiar de rama"
-    exit 1
-fi
-
-gum spin \
-    --spinner dot \
-    --title "Integrando cambios..." \
-    -- git merge "$SOURCE_BRANCH"
-
-if [ $? -ne 0 ]; then
-    gum style --foreground 1 \
-        "✗ El merge tuvo conflictos"
-    exit 1
-fi
-
-git branch -d "$SOURCE_BRANCH"
-
-gum style \
-    --foreground 2 \
-    "✓ Rama integrada"
-
-gum style \
-    --foreground 6 \
-    "🗑 Rama eliminada: $SOURCE_BRANCH"

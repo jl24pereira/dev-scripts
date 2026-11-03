@@ -1,10 +1,21 @@
 #!/usr/bin/env zsh
+# 🐳 Inicia Docker en WSL2 (systemd o service) y espera a que responda
+source ${0:A:h}/lib/ui.zsh
 
-if service docker status > /dev/null 2>&1; then
-    gum style --foreground 2 "✓ Docker ya está corriendo"
+if docker info >/dev/null 2>&1; then
+  ok "Docker ya está corriendo"
 else
-    gum spin --spinner dot --title "Iniciando Docker..." -- sudo service docker start
-    gum style --foreground 2 "✓ Docker iniciado"
+  sudo -v || exit 1   # pide la contraseña ANTES del spinner (dentro quedaría oculta)
+  if [[ $(ps -p 1 -o comm=) == systemd ]]; then START=(sudo systemctl start docker)
+  else START=(sudo service docker start)
+  fi
+  run "Iniciando Docker" $START || exit 1
+  gum spin --spinner dot --title "Esperando al daemon..." -- \
+    zsh -c 'for i in {1..30}; do docker info >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1' \
+    || { err "Docker no respondió en 30s"; exit 1 }
+  ok "Docker iniciado"
 fi
 
-gum confirm "¿Abrir Lazydocker?" && lazydocker
+(( $+commands[lazydocker] )) && gum confirm "¿Abrir Lazydocker?" && lazydocker
+exit 0
+

@@ -1,53 +1,47 @@
 #!/usr/bin/env zsh
+# 🔀 Cambia de rama (locales y remotas, las más recientes primero) con manejo de cambios sin commit
+source ${0:A:h}/lib/ui.zsh
+require_repo
+banner "🌿 Git Switch"
 
-gum style \
-    --foreground 2 --border rounded --padding "1 2" \
-    "🌿 Git Switch"
+quick_fetch --all
+CURRENT=$(git branch --show-current)
 
-if ! git rev-parse --git-dir > /dev/null 2>&1; then
-    gum style --foreground 1 "✗ No estás en un repositorio git"
-    exit 1
+local -a local_br remote_br items
+local_br=(${(f)"$(git for-each-ref --sort=-committerdate --format='%(refname:short)' refs/heads)"})
+remote_br=(${(f)"$(git for-each-ref --sort=-committerdate --format='%(refname:lstrip=3)' refs/remotes | grep -vx HEAD)"})
+
+PREV=$(git rev-parse --abbrev-ref '@{-1}' 2>/dev/null)
+[[ -n $PREV && $PREV != '@{-1}' ]] && items+="↩ $PREV  [anterior]"
+for b in ${(u)local_br} ${(u)remote_br}; do
+  [[ $b == $CURRENT ]] && continue
+  if (( ${local_br[(Ie)$b]} && ${remote_br[(Ie)$b]} )); then items+="$b  [local+remota]"
+  elif (( ${local_br[(Ie)$b]} )); then items+="$b  [local]"
+  else items+="$b  [remota]"
+  fi
+done
+items=(${(u)items})
+(( $#items )) || { warn "No hay otras ramas"; exit 0 }
+
+SELECTED=$(print -rl -- $items | gum filter --header "🌿 Rama (actual: $CURRENT)" --placeholder "buscar...") || cancel
+BRANCH=${${SELECTED#↩ }%%  *}
+
+if is_dirty; then
+  ACTION=$(gum choose --header "Tienes cambios sin commit" "Llevarlos a $BRANCH" "Guardarlos en stash" "Cancelar") || cancel
+  case $ACTION in
+    Guardar*) run "Guardando stash" git stash push -u -m "git-switch: desde $CURRENT" || exit 1
+              dim "Recupéralos en $CURRENT con: git stash pop" ;;
+    Cancelar) cancel ;;
+  esac
 fi
 
-# Actualizar ramas remotas
-gum spin --spinner dot --title "Obteniendo ramas..." -- git fetch --all
+run "Cambiando a $BRANCH" git switch $BRANCH || exit 1
+ok "Cambiado a rama: $BRANCH"
 
-# Obtener ramas locales y remotas
-LOCAL=$(git branch | sed 's/\*//g' | sed 's/ //g')
-REMOTE=$(git branch -r | sed 's/origin\///g' | sed 's/ //g' | grep -v "HEAD")
-
-# Construir lista con indicadores
-LISTA=""
-ALL_BRANCHES=$(echo "$LOCAL\n$REMOTE" | sort -u)
-
-while IFS= read -r BRANCH; do
-    IS_LOCAL=$(echo $LOCAL | tr ' ' '\n' | grep -x "$BRANCH")
-    IS_REMOTE=$(echo $REMOTE | tr ' ' '\n' | grep -x "$BRANCH")
-
-    if [ -n "$IS_LOCAL" ] && [ -n "$IS_REMOTE" ]; then
-        LISTA="$LISTA$BRANCH [local+remota]\n"
-    elif [ -n "$IS_LOCAL" ]; then
-        LISTA="$LISTA$BRANCH [local]\n"
-    else
-        LISTA="$LISTA$BRANCH [remota]\n"
-    fi
-done <<< $(echo "$ALL_BRANCHES")
-
-# Seleccionar rama
-SELECTED=$(echo $LISTA | gum choose --header "🌿 Selecciona una rama")
-
-if [ -z "$SELECTED" ]; then
-    gum style --foreground 1 "✗ No seleccionaste ninguna rama"
-    exit 0
+if has_upstream; then
+  BEHIND=$(git rev-list --count 'HEAD..@{u}')
+  (( BEHIND )) && gum confirm "Está $BEHIND commit(s) atrás del remoto. ¿Hacer pull?" \
+    && run "Actualizando" git pull --ff-only && ok "Actualizada"
 fi
+exit 0
 
-# Extraer solo el nombre de la rama sin el indicador
-BRANCH=$(echo $SELECTED | awk '{print $1}')
-
-gum spin --spinner dot --title "Cambiando a $BRANCH..." -- git switch $BRANCH
-
-if [ $? -eq 0 ]; then
-    gum style --foreground 2 "✓ Cambiado a rama: $BRANCH"
-else
-    gum style --foreground 1 "✗ Error al cambiar de rama"
-fi

@@ -1,51 +1,67 @@
 #!/usr/bin/env zsh
+# 🍃 Genera un proyecto Spring Boot (spring init) y opcionalmente lo deja listo para `dev`
+#    copiando k8s/ y Dockerfile de otro proyecto como plantilla.
+source ${0:A:h}/lib/ui.zsh
+PROJECTS_DIR=${DEV_PROJECTS:-$HOME/projects}
+(( $+commands[spring] )) || { err "Falta el Spring Boot CLI (sdk install springboot)"; exit 1 }
+banner "🍃 Spring Boot Project Generator"
 
-gum style \
-    --foreground 2 --border rounded --padding "1 2" \
-    "🍃 Spring Boot Project Generator"
+GROUP=$(gum input --header "Group ID" --value "${SPRING_GROUP:-com.empresa}") || cancel
+ARTIFACT=$(gum input --header "Artifact ID" --placeholder "mi-servicio") || cancel
+[[ $ARTIFACT =~ '^[a-z][a-z0-9-]*$' ]] || { err "Usa minúsculas, números y guiones (ej: mi-servicio)"; exit 1 }
+TARGET=$PROJECTS_DIR/$ARTIFACT
+[[ -e $TARGET ]] && { err "Ya existe $TARGET"; exit 1 }
+DESCRIPTION=$(gum input --header "Descripción" --placeholder "Qué hace el servicio") || cancel
 
-# Datos del proyecto
-GROUP=$(gum input --placeholder "Group ID (ej: com.empresa)" --header "Group ID")
-ARTIFACT=$(gum input --placeholder "Nombre del proyecto (ej: mi-servicio)" --header "Artifact ID")
-DESCRIPTION=$(gum input --placeholder "Descripción del proyecto" --header "Descripción")
+BUILD=$(gum choose --header "🔧 Tipo de build" gradle-project gradle-project-kotlin maven-project) || cancel
+JAVA=$(gum choose --header "☕ Versión de Java" 21 25 17) || cancel   # Boot 3/4 requiere 17+
 
-# Tipo de build
-BUILD=$(gum choose "gradle-project" "maven-project" --header "🔧 Tipo de build")
+DEPS=$(spring init --list | grep -E '^\| [a-z]' | awk -F'|' '{gsub(/ /,"",$2); if ($2 != "id") print $2}' \
+  | gum filter --no-limit --header "📦 Dependencias (Tab marca, Enter confirma)") || cancel
+DEPS_CSV=${(j:,:)${(f)DEPS}}
+[[ -n $SPRING_DEFAULT_DEPS ]] && DEPS_CSV=${DEPS_CSV:+$DEPS_CSV,}$SPRING_DEFAULT_DEPS
 
-# Versión de Java
-JAVA=$(gum choose "21" "17" "11" --header "☕ Versión de Java")
+# Plantilla para el ambiente local: cualquier proyecto con k8s/vars.yaml
+local -a templates=($PROJECTS_DIR/*/k8s/vars.yaml(N:h:h:t))
+TEMPLATE=""
+if (( $#templates )); then
+  TEMPLATE=$(gum choose --header "☁  Copiar k8s/ y Dockerfile de..." "(ninguno)" $templates) || cancel
+  [[ $TEMPLATE == "(ninguno)" ]] && TEMPLATE=""
+fi
 
-# Dependencias
-DEPS=$(spring init --list | grep -E "^\| [a-z]" | awk -F'|' '{print $2}' | sed 's/ //g' | gum filter --no-limit --header "📦 Dependencias (espacio para seleccionar, enter para confirmar)")
+echo
+gum style --foreground 3 "Resumen:"
+print -r -- "  Group:     $GROUP
+  Artifact:  $ARTIFACT  →  $TARGET
+  Build:     $BUILD · Java $JAVA
+  Deps:      ${DEPS_CSV:-(ninguna)}
+  Plantilla: ${TEMPLATE:-(ninguna)}"
+echo
+gum confirm "¿Crear proyecto?" || cancel
 
-# Convertir selección a formato csv
-DEPS_CSV=$(echo $DEPS | tr -s '\n' ',' | sed 's/.$//')
+run "Creando proyecto" spring init --group-id=$GROUP --artifact-id=$ARTIFACT --name=$ARTIFACT \
+  --description="$DESCRIPTION" --type=$BUILD --java-version=$JAVA \
+  ${DEPS_CSV:+--dependencies=$DEPS_CSV} --extract $TARGET || exit 1
+ok "Proyecto creado en $TARGET"
 
-# Confirmar
-echo ""
-gum style --foreground 3 "Resumen del proyecto:"
-echo "  Group:       $GROUP"
-echo "  Artifact:    $ARTIFACT"
-echo "  Build:       $BUILD"
-echo "  Java:        $JAVA"
-echo "  Deps:        $DEPS_CSV"
-echo ""
+if [[ -n $TEMPLATE ]]; then
+  SRC=$PROJECTS_DIR/$TEMPLATE
+  OLD=$(yq '.local.appName' $SRC/k8s/vars.yaml)
+  mkdir -p $TARGET/k8s
+  cp $SRC/k8s/*.yaml $TARGET/k8s/
+  [[ -f $SRC/Dockerfile ]] && cp $SRC/Dockerfile $TARGET/
+  [[ -f $SRC/.dockerignore ]] && cp $SRC/.dockerignore $TARGET/
+  # En vars.yaml cambia el nombre de la app en todos los ambientes (hola-mundo → mi-servicio, hola-mundo-sa → mi-servicio-sa)
+  OLD=$OLD NEW=$ARTIFACT yq -i '(.. | select(tag == "!!str")) |= sub(strenv(OLD); strenv(NEW))' $TARGET/k8s/vars.yaml
+  ok "k8s/ y Dockerfile copiados de $TEMPLATE ($OLD → $ARTIFACT). Revisa k8s/vars.yaml"
+  grep -q '^\.rendered' $TARGET/.gitignore 2>/dev/null || print '.rendered/' >>$TARGET/.gitignore
+fi
 
-gum confirm "¿Crear proyecto?" || exit 0
+if gum confirm "¿Inicializar git con un primer commit?"; then
+  (cd $TARGET && git init -q -b ${GIT_BASE:-develop} && git add -A && git commit -qm "chore: proyecto inicial") \
+    && ok "Repositorio git inicializado"
+fi
 
-# Crear proyecto
-gum spin --spinner dot --title "Creando proyecto..." -- \
-    spring init \
-        --group-id=$GROUP \
-        --artifact-id=$ARTIFACT \
-        --description="$DESCRIPTION" \
-        --type=$BUILD \
-        --java-version=$JAVA \
-        --dependencies=$DEPS_CSV \
-        --extract \
-        ~/projects/$ARTIFACT
+gum confirm "¿Abrir en Neovim?" && cd $TARGET && nvim .
+exit 0
 
-gum style --foreground 2 "✓ Proyecto creado en ~/projects/$ARTIFACT"
-
-# Abrir en Neovim
-gum confirm "¿Abrir en Neovim?" && cd ~/projects/$ARTIFACT && nvim .

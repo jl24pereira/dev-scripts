@@ -1,69 +1,53 @@
 #!/usr/bin/env zsh
+# 🐘 Menú de tasks de Gradle (incluye bootRun con perfil, un test y Sonar)
+source ${0:A:h}/lib/ui.zsh
+banner "🐘 Gradle Runner"
 
-gum style \
-    --foreground 2 --border rounded --padding "1 2" \
-    "🐘 Gradle Runner"
+[[ -f build.gradle || -f build.gradle.kts || -f settings.gradle || -f settings.gradle.kts ]] \
+  || { err "No hay build.gradle en esta carpeta (corre desde la raíz del proyecto)"; exit 1 }
 
-# Buscar build.gradle en el directorio actual o subdirectorios
-BUILD_FILE=$(find . -name "build.gradle" -o -name "build.gradle.kts" 2>/dev/null | head -1)
-
-if [ -z "$BUILD_FILE" ]; then
-    gum style --foreground 1 "✗ No se encontró build.gradle en el proyecto"
-    exit 1
+if [[ -x ./gradlew ]]; then GRADLE=(./gradlew)
+elif [[ -f ./gradlew ]]; then
+  GRADLE=(sh ./gradlew)   # sin chmod: no ensuciar git
+  dim "gradlew sin permiso de ejecución. Arreglo permanente: git update-index --chmod=+x gradlew"
+else GRADLE=(gradle)
 fi
 
-# Dar permisos y definir comando
-if [ -f "./gradlew" ]; then
-    chmod +x ./gradlew
-    GRADLE_CMD="./gradlew"
-else
-    GRADLE_CMD="gradle"
+TASK=$(gum filter --header "🔧 Task de Gradle" --placeholder "buscar..." \
+  "build" "clean build" "build -x test" "bootRun" "bootRun (perfil local)" \
+  "test" "clean test" "test (una clase)" "bootJar" "dependencies" "sonar") || cancel
+
+case $TASK in
+  "bootRun (perfil local)")
+    PROFILE=$(gum input --header "Perfil" --value "${SPRING_PROFILE:-local}") || cancel
+    CMD=(bootRun --args="--spring.profiles.active=$PROFILE") ;;
+  "test (una clase)")
+    CLASS=$(gum input --header "Clase o patrón" --placeholder "HolaControllerTest o *Controller*") || cancel
+    CMD=(test --tests "*$CLASS*") ;;
+  dependencies) CMD=(dependencies --configuration runtimeClasspath) ;;
+  sonar)
+    # El plugin de Sonar lee SONAR_HOST_URL y SONAR_TOKEN del entorno: el token nunca va en la línea de comandos
+    export SONAR_HOST_URL=${SONAR_HOST_URL:-$SONAR_HOST}
+    [[ -n $SONAR_HOST_URL && -n $SONAR_TOKEN ]] || { err "Define SONAR_HOST (o SONAR_HOST_URL) y SONAR_TOKEN"; exit 1 }
+    NAME=${PWD:t}
+    CMD=(clean test sonar -Dsonar.branch.name=${SONAR_BRANCH:-develop}
+         -Dsonar.projectKey=${NAME}_CI -Dsonar.projectVersion=Local$(date +%d%m%Y).1) ;;
+  *) CMD=(${=TASK}) ;;
+esac
+
+info "⚙  ${GRADLE[-1]} ${(j: :)${(q-)CMD}}"
+echo
+
+if [[ $CMD[1] == bootRun ]]; then
+  $GRADLE $CMD; exit $?
 fi
 
-# Seleccionar task
-TASK=$(gum choose \
-    "build" \
-    "clean" \
-    "clean build" \
-    "bootRun" \
-    "test" \
-    "clean test" \
-    "sonar" \
-    --header "🔧 Selecciona la task de Gradle")
-
-if [ -z "$TASK" ]; then
-    gum style --foreground 1 "✗ No seleccionaste ninguna task"
-    exit 0
+$GRADLE $CMD 2>&1 | tee $UI_LOG
+CODE=${pipestatus[1]}
+echo
+if (( CODE == 0 )); then ok "gradle $TASK completado"
+else err "gradle $TASK falló"
 fi
+gum confirm --default=$(( CODE != 0 )) "¿Ver log completo?" && gum pager <$UI_LOG
+exit $CODE
 
-# Nombre dinamico del proyecto
-PROJECT_NAME=$(basename "$PWD")
-PROJECT_KEY="${PROJECT_NAME}_CI"
-PROJECT_VERSION="Local$(date +%d%m%Y).1"
-
-if [ "$TASK" = "sonar" ]; then
-    TASK_CMD="clean test sonar -Dsonar.host.url=${SONAR_HOST} -Dsonar.token=${SONAR_TOKEN} -Dsonar.branch.name=develop -Dsonar.projectKey=${PROJECT_KEY} -Dsonar.projectVersion=${PROJECT_VERSION}"
-else
-    TASK_CMD="$TASK"
-fi
-
-gum style --foreground 3 "⚙️  Ejecutando: gradle $TASK: $TASK_CMD"
-echo ""
-
-
-# Ejecutar task — pasar como array para manejar múltiples tasks
-if [ "$TASK" = "bootRun" ]; then
-    $GRADLE_CMD ${=TASK_CMD}
-else
-    $GRADLE_CMD ${=TASK_CMD} 2>&1 | tee /tmp/gradle-output.log
-    EXIT_CODE=${pipestatus[1]}
-
-    if [ $EXIT_CODE -eq 0 ]; then
-        gum style --foreground 2 "✓ gradle $TASK completado exitosamente"
-    else
-        gum style --foreground 1 "✗ gradle $TASK falló"
-    fi
-
-    echo ""
-    gum confirm "¿Ver logs completos?" && gum pager < /tmp/gradle-output.log
-fi

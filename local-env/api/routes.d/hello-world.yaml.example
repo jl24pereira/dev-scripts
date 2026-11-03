@@ -1,0 +1,16 @@
+
+# Rutas de un microservicio para el API Gateway local (dev apigw).
+# Copia como <app>.yaml (solo se leen los *.yaml de esta carpeta).
+app: hola-mundo          # = label app del Deployment
+namespace: local         # opcional (local)
+localPort: 9001          # único por app: puerto del Service LoadBalancer en el nodo k3d
+containerPort: 8080      # opcional (8080)
+routes:
+  - method: get
+    path: /hola
+  - method: post
+    path: /channels/{channelId}/messages
+    target: /api/channels/{channelId}/messages   # opcional: ruta en el backend (por defecto = path)
+  - method: any
+    path: /hola-mundo/{proxy+}
+    target: /{proxy}

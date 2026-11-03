@@ -1,67 +1,86 @@
 #!/usr/bin/env zsh
+# 📝 Commit convencional: elige archivos, tipo(scope): mensaje, cuerpo y ticket (detectado de la rama)
+source ${0:A:h}/lib/ui.zsh
+require_repo
+banner "📝 Git Commit"
 
-gum style \
-    --foreground 2 --border rounded --padding "1 2" \
-    "📝 Git Commit"
+# Estado con -z: respeta espacios y renombrados ("R  nuevo\0viejo\0")
+local -a entries pick staged added
+entries=("${(@0)$(git status --porcelain -z --untracked-files=all)}")
+local i=1 e xy p
+while (( i <= $#entries )); do
+  e=$entries[i]; (( i++ ))
+  [[ -z $e ]] && continue
+  xy=${e[1,2]} p=${e[4,-1]}
+  [[ ${xy[1]} == [RC] ]] && (( i++ ))                 # salta la ruta original
+  [[ ${xy[1]} != [\ ?] ]] && staged+=$p
+  [[ ${xy[2]} != ' ' ]] && pick+="${${xy[2]}/\?/+} $p" # M modificado, D eliminado, + nuevo
+done
 
-# Verificar que estamos en un repo
-if ! git rev-parse --git-dir > /dev/null 2>&1; then
-    gum style --foreground 1 "✗ No estás en un repositorio git"
-    exit 1
+(( $#staged + $#pick )) || { ok "No hay cambios para commitear"; exit 0 }
+
+if (( $#staged )); then
+  info "✅ Ya en stage:"; print -rl -- "  "${^staged}; echo
 fi
-
-# Mostrar archivos modificados y seleccionar cuáles agregar
-FILES=$(git status --short | awk '{print $2}' | gum choose --no-limit --header "📁 Selecciona archivos para el commit")
-
-if [ -z "$FILES" ]; then
-    gum style --foreground 1 "✗ No seleccionaste archivos"
-    exit 1
+if (( $#pick )); then
+  sel=("${(@f)$(print -rl -- $pick | gum choose --no-limit --height 20 \
+        --header "📁 Agregar al commit (espacio marca${staged:+, Enter sin marcar = solo lo staged})")}") || cancel
+  added=(${${sel:#}#? })
+  (( $#added )) && { git add -A -- $added || exit 1 }
 fi
+git diff --cached --quiet && { err "No hay nada en stage"; exit 1 }
 
-# Agregar archivos seleccionados
-echo $FILES | xargs git add
+undo() {  # al cancelar, deja el stage como estaba
+  (( $#added )) && git restore --staged -- $added 2>/dev/null
+  cancel
+}
 
-# Tipo de commit
-TYPE=$(gum choose \
-    "feat" \
-    "fix" \
-    "docs" \
-    "refactor" \
-    "test" \
-    "chore" \
-    "style" \
-    --header "🏷️ Tipo de commit")
+TYPE=$(gum choose --header "🏷  Tipo de commit" \
+  "feat      nueva funcionalidad" \
+  "fix       corrección de bug" \
+  "refactor  cambio interno sin cambiar comportamiento" \
+  "perf      rendimiento" \
+  "test      pruebas" \
+  "docs      documentación" \
+  "build     Gradle, dependencias, Docker" \
+  "ci        pipelines" \
+  "chore     mantenimiento" \
+  "style     formato" \
+  "revert    revertir") || undo
+TYPE=${TYPE%% *}; [[ -n $TYPE ]] || undo
 
-# Mensaje principal
-MESSAGE=$(gum input --placeholder "Descripción corta del cambio" --header "💬 Mensaje principal")
+SCOPE=$(gum input --header "🎯 Scope (opcional)" --placeholder "ej: api, k8s, sqs") || undo
+PREFIX="$TYPE${SCOPE:+($SCOPE)}: "
 
-if [ -z "$MESSAGE" ]; then
-    gum style --foreground 1 "✗ El mensaje no puede estar vacío"
-    exit 1
+MESSAGE=$(gum input --header "💬 $PREFIX" --placeholder "descripción corta en imperativo" \
+  --char-limit $(( 72 - ${#PREFIX} ))) || undo
+[[ -n $MESSAGE ]] || { err "El mensaje no puede estar vacío"; undo }
+
+BODY=$(gum write --header "📄 Descripción (opcional, Ctrl+D termina · Esc omite)" \
+  --placeholder "Por qué del cambio. 'BREAKING CHANGE: ...' si rompe compatibilidad") || BODY=""
+
+# Ticket desde la rama: ABC-123 (Jira) o feature/12345-... (work item de Azure DevOps)
+BRANCH=$(git branch --show-current)
+GUESS=""
+if [[ $BRANCH =~ '([A-Z][A-Z0-9]+-[0-9]+)' ]]; then GUESS=$match[1]
+elif [[ $BRANCH =~ '/([0-9]{3,})' ]]; then GUESS="#$match[1]"
 fi
+TICKET=$(gum input --header "🎫 Ticket (opcional)" --value "$GUESS" --placeholder "#1234 o ABC-123") || undo
 
-# Descripción adicional (opcional)
-gum style --foreground 3 "📄 Descripción adicional (opcional, Ctrl+D para terminar):"
-BODY=$(gum write --placeholder "Detalles adicionales del cambio...")
+MSG="$PREFIX$MESSAGE"
+[[ -n $BODY ]] && MSG+=$'\n\n'"$BODY"
+[[ -n $TICKET ]] && MSG+=$'\n\n'"Refs: $TICKET"
 
-# Confirmar
-echo ""
-gum style --foreground 3 "Resumen:"
-echo "  Tipo:     $TYPE"
-echo "  Mensaje:  $MESSAGE"
-echo ""
+echo
+gum style --border rounded --padding "0 1" --border-foreground 8 "$MSG"
+git --no-pager diff --cached --stat | sed 's/^/  /'
+echo
+gum confirm "¿Hacer commit?" || undo
 
-gum confirm "¿Hacer commit?" || exit 0
-
-# Hacer commit
-if [ -z "$BODY" ]; then
-    git commit -m "$TYPE: $MESSAGE"
+# Sin spinner: los hooks (lint, tests) deben verse
+if git commit -q -F - <<<"$MSG"; then
+  ok "Commit realizado: $(git log -1 --format='%h %s')"
 else
-    git commit -m "$TYPE: $MESSAGE" -m "$BODY"
-fi
-
-if [ $? -eq 0 ]; then
-    gum style --foreground 2 "✓ Commit realizado: $TYPE: $MESSAGE"
-else
-    gum style --foreground 1 "✗ Error al hacer el commit"
+  err "Error al hacer el commit (¿hook?). El stage se conserva."
+  exit 1
 fi

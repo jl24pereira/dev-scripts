@@ -1,29 +1,65 @@
 #!/usr/bin/env zsh
-# ☁ Ambiente local: k3d (en lugar de EKS) + Floci (en lugar de AWS)
+# ☁ dev — ambiente local: k3d (en lugar de EKS) + Floci (en lugar de AWS)
 #
-# Uso (desde la raíz de tu proyecto):
-#   dev            → menú interactivo
-#   dev deploy     → acción directa: up | deploy | apply | status | logs | forward | aws | pause | destroy
+# Uso:
+#   dev                              menú interactivo
+#   dev [-p proyecto] <acción>       acción directa
 #
-# Requiere: docker, k3d, kubectl, yq (mikefarah), gum, aws (perfil "floci")
- 
-LOCAL_ENV=${0:A:h}
-PROJECT=$PWD
-K8S=$PROJECT/k8s
-VARS=$K8S/vars.yaml
+# Acciones:
+#   up        levanta red, Floci y clúster k3d
+#   deploy    compila (Gradle), construye imagen, importa a k3d y aplica manifiestos
+#   apply     solo renderiza y aplica manifiestos (reinicia pods igual)
+#   apigw     publica el API Gateway REST en Floci desde local-env/api/routes.d/*.yaml
+#   status    estado del proyecto actual         overview  resumen de todos los proyectos
+#   logs      logs del pod                       forward   port-forward
+#   aws       recursos en Floci                  pause     detiene sin borrar nada
+#   destroy   elimina clúster (y opcionalmente Floci)
+#   render <dir_k8s> [ambiente] [salida]         rellena $(variables) desde vars.yaml
+#   help
+#
+# Proyecto: -p <nombre|ruta>, si no la carpeta actual (si tiene k8s/vars.yaml),
+#           si no el último usado. Los proyectos se buscan en $DEV_PROJECTS (~/projects).
+#
+# Variables: CLUSTER (local) · DEV_PROJECTS · FLOCI_IP (172.18.0.10) · AWS_REGION
+#            DRY_RUN=1 dev apigw  → muestra lo que haría sin tocar nada
+#
+# Requiere: docker, k3d, kubectl, yq (mikefarah), gum, aws (perfil "floci"), curl
+
+setopt pipefail
+zmodload zsh/datetime
+
+SELF=${0:A}
+DEV_HOME=${0:A:h}
+LOCAL_ENV=$DEV_HOME/local-env
+ROUTES_DIR=${ROUTES_DIR:-$LOCAL_ENV/api/routes.d}
+PROJECTS_DIR=${DEV_PROJECTS:-$HOME/projects}
+CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/dev
+LOG=$CACHE/last.log
+
 CLUSTER=${CLUSTER:-local}
-NETWORK=aws-local
-FLOCI_IP=172.18.0.10
-LOG=$(mktemp -t devenv.XXXXXX)
-trap 'rm -f $LOG' EXIT
- 
+NETWORK=${NETWORK:-aws-local}
+SUBNET=172.18.0.0/16
+IP_RANGE=172.18.128.0/17          # IPs dinámicas (k3d) lejos de las fijas (Floci = .10)
+FLOCI_IP=${FLOCI_IP:-172.18.0.10}
+FLOCI=http://localhost:4566
+REGION=${AWS_REGION:-us-east-1}
+API_ID=${API_ID:-local}
+STAGE=${STAGE:-local}
+DRY_RUN=${DRY_RUN:-0}
+
+mkdir -p $CACHE
+
 # ---------------------------------------------------------------- estilos
-ok()    { gum style --foreground 42  "✔ $*" }
-warn()  { gum style --foreground 214 "! $*" }
-err()   { gum style --foreground 196 "✘ $*" }
-title() { gum style --bold --foreground 212 "$*" }
- 
+(( $+commands[gum] )) && HAS_GUM=1 || HAS_GUM=0
+_s()    { local fg=$1; shift; if (( HAS_GUM )); then gum style --foreground $fg "$*"; else print -r -- "$*"; fi }
+ok()    { _s 42  "✔ $*" }
+warn()  { _s 214 "! $*" }
+err()   { _s 196 "✘ $*" >&2 }
+dim()   { _s 245 "$*" }
+title() { if (( HAS_GUM )); then gum style --bold --foreground 212 "$*"; else print -r -- "== $*"; fi }
+
 # Ejecuta un comando con spinner; si falla, muestra las últimas líneas del log.
+# Para funciones de este archivo usa: step "msg" $SELF <acción> ...
 step() {
   local msg=$1; shift
   if gum spin --spinner dot --title "$msg..." -- zsh -c '"$@" >"$0" 2>&1' $LOG "$@"; then
@@ -31,51 +67,203 @@ step() {
   else
     err "$msg falló:"
     tail -n 25 $LOG | gum style --foreground 245 --padding "0 2"
+    dim "Log completo: $LOG"
     return 1
   fi
 }
- 
+
 check_tools() {
-  local missing=()
-  for t in docker k3d kubectl yq gum aws; do
-    (( $+commands[$t] )) || missing+=$t
-  done
-  (( ${#missing} == 0 )) || { err "Faltan herramientas: ${missing[*]}"; exit 1 }
+  local t; local -a missing
+  for t in "$@"; do (( $+commands[$t] )) || missing+=$t; done
+  (( $#missing == 0 )) || { err "Faltan herramientas: $missing"; exit 1 }
+  yq --version 2>/dev/null | grep -q mikefarah || { err "Necesito el yq de mikefarah (el de apt es otro programa)."; exit 1 }
 }
- 
-# Lee los datos del bloque local de k8s/vars.yaml
+
+# ---------------------------------------------------------------- proyectos
+list_projects() { print -rl -- $PROJECTS_DIR/*/k8s/vars.yaml(N:h:h:t) }
+
+# Lee el bloque local de k8s/vars.yaml
 load_app() {
-  [[ -f $VARS ]] || { err "No encontré k8s/vars.yaml. Corre 'dev' desde la raíz de tu proyecto."; return 1 }
-  APP=$(yq '.local.appName' $VARS)
-  NS=$(yq '.local.namespace' $VARS)
-  PORT=$(yq '.local.containerPort' $VARS)
-  IMAGE="$(yq '.local.repository' $VARS):$(yq '.local.imageTag' $VARS)"
+  local -a v
+  v=("${(@f)$(yq '.local | (.appName // "", .namespace // "local", .containerPort // 8080,
+                .repository // .appName // "", .imageTag // "local", .dockerfile // "Dockerfile",
+                .gradleTask // "build -x test")' $VARS)}")
+  APP=$v[1] NS=$v[2] PORT=$v[3] IMAGE="$v[4]:$v[5]" DOCKERFILE=$v[6] GRADLE_TASK=$v[7]
+  [[ -n $APP ]] || { err "Falta local.appName en $VARS"; return 1 }
   DEPLOY="deployment/$APP-deploy"
+  # dockerBuildArgs: mapa {CLAVE: valor} o lista ["CLAVE=valor"]
+  BUILD_ARGS=(${(f)"$(yq '.local.dockerBuildArgs // {} |
+      ((select(tag == "!!map") | to_entries | .[] | .key + "=" + (.value | to_string)),
+       (select(tag == "!!seq") | .[]))' $VARS)"})
+  BUILD_ARGS=(${BUILD_ARGS/#/--build-arg=})
 }
- 
-cluster_running() {
-  docker ps --format '{{.Names}}' | grep -q "^k3d-$CLUSTER-server-0$"
+
+set_project() {  # $1 = nombre (en $PROJECTS_DIR) o ruta
+  local p=$1
+  [[ -d $p ]] || p=$PROJECTS_DIR/$1
+  [[ -f $p/k8s/vars.yaml ]] || { err "No encontré k8s/vars.yaml en $p"; return 1 }
+  PROJECT=${p:A} K8S=${p:A}/k8s VARS=${p:A}/k8s/vars.yaml
+  print -r -- $PROJECT >$CACHE/last-project
+  load_app
 }
- 
+
+pick_project() {
+  local -a names=($(list_projects))
+  (( $#names )) || { err "No hay proyectos con k8s/vars.yaml en $PROJECTS_DIR"; return 1 }
+  local sel
+  sel=$(print -rl -- $names | gum filter --header "📦 Proyecto" --placeholder "buscar...") || return 1
+  set_project $PROJECTS_DIR/$sel
+}
+
+resolve_project() {  # -p > carpeta actual > último usado
+  if [[ -n $OPT_PROJECT ]]; then set_project $OPT_PROJECT; return
+  elif [[ -f $PWD/k8s/vars.yaml ]]; then set_project $PWD
+  elif [[ -f $CACHE/last-project && -f $(<$CACHE/last-project)/k8s/vars.yaml ]]; then
+    set_project $(<$CACHE/last-project)
+  fi
+  return 0
+}
+
+need_project() { [[ -n $APP ]] || pick_project }
+
+cluster_running() { docker ps --format '{{.Names}}' | grep -q "^k3d-$CLUSTER-server-0$" }
+floci_running()   { docker ps --format '{{.Names}}' | grep -q '^floci$' }
+
 header() {
   local cl fl app=""
   cluster_running && cl="🟢 k3d" || cl="🔴 k3d"
-  docker ps --format '{{.Names}}' | grep -q '^floci$' && fl="🟢 Floci" || fl="🔴 Floci"
-  [[ -f $VARS ]] && app="  ·  📦 $(yq '.local.appName' $VARS) → ns $(yq '.local.namespace' $VARS)"
+  floci_running   && fl="🟢 Floci" || fl="🔴 Floci"
+  [[ -n $APP ]] && app="  ·  📦 $APP → ns $NS" || app="  ·  📦 (sin proyecto)"
   gum style --border rounded --border-foreground 212 --padding "0 2" --margin "1 0" \
     "$(title '☁  Ambiente local')" "$cl   $fl$app"
 }
- 
+
+# ---------------------------------------------------------------- archivos embebidos
+# compose de Floci: usa local-env/compose.yaml si existe, si no este por defecto
+compose_file() {
+  if [[ -f $LOCAL_ENV/compose.yaml ]]; then print -r -- $LOCAL_ENV/compose.yaml; return; fi
+  cat >$CACHE/compose.yaml <<EOF
+name: floci
+services:
+  floci:
+    image: floci/floci:latest
+    container_name: floci
+    user: root
+    restart: unless-stopped
+    ports: ["4566:4566"]
+    environment:
+      FLOCI_DEFAULT_REGION: $REGION
+      FLOCI_STORAGE_MODE: hybrid
+      FLOCI_STORAGE_PERSISTENT_PATH: /data
+      FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK: $NETWORK
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - floci-data:/data
+    networks:
+      $NETWORK:
+        ipv4_address: $FLOCI_IP
+networks:
+  $NETWORK:
+    external: true
+volumes:
+  floci-data:
+EOF
+  print -r -- $CACHE/compose.yaml
+}
+
+# Service + EndpointSlice "floci" (DNS sin depender del DNS corporativo) y ConfigMap
+# "aws-local" para envFrom. Se genera por namespace, así cualquier app ve a Floci.
+floci_manifest() {  # $1 = namespace → imprime la ruta del archivo
+  local f=$CACHE/floci-$1.yaml
+  cat >$f <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: floci
+  namespace: $1
+  labels: {app.kubernetes.io/managed-by: dev-scripts}
+spec:
+  ports: [{name: http, port: 4566, targetPort: 4566, protocol: TCP}]
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: floci-1
+  namespace: $1
+  labels: {kubernetes.io/service-name: floci, app.kubernetes.io/managed-by: dev-scripts}
+addressType: IPv4
+ports: [{name: http, port: 4566, protocol: TCP}]
+endpoints: [{addresses: ["$FLOCI_IP"]}]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aws-local
+  namespace: $1
+  labels: {app.kubernetes.io/managed-by: dev-scripts}
+data:
+  AWS_ENDPOINT_URL: http://floci:4566
+  AWS_REGION: $REGION
+  AWS_DEFAULT_REGION: $REGION
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+EOF
+  print -r -- $f
+}
+
+ensure_namespace() {  # $1 = namespace: lo crea y le conecta Floci
+  kubectl get namespace $1 >/dev/null 2>&1 || step "Creando namespace $1" kubectl create namespace $1 || return 1
+  step "Conectando namespace $1 con Floci" kubectl apply -f $(floci_manifest $1)
+}
+
+# ---------------------------------------------------------------- render (antes render.sh)
+# Reemplaza $(variable) en las plantillas de k8s/, igual que el pipeline de Azure DevOps.
+cmd_render() {  # $1 dir_k8s  $2 ambiente  $3 salida
+  local src=${1:-$K8S}
+  [[ -n $src ]] || { err "Uso: dev render <dir_k8s> [ambiente] [dir_salida]"; return 1 }
+  src=${src:A}
+  local env=${2:-local}
+  local out=${3:-${src:h}/.rendered/$env}
+  local vars=$src/vars.yaml
+  [[ -f $vars ]] || { err "No encontré $vars"; return 1 }
+
+  # Aplana el bloque del ambiente en clave=valor (anidados con punto: limits.memory)
+  local -a pairs
+  pairs=(${(f)"$(yq ".\"$env\" // {}" $vars |
+    yq '.. | select(tag != "!!map" and tag != "!!seq") | (path | join(".")) + "=" + (. | to_string)')"})
+  (( $#pairs )) || { err "No encontré el bloque '$env' en $vars"; return 1 }
+
+  mkdir -p $out && rm -f $out/*.yaml(N)
+  local f p k v content pend=0
+  for f in $src/*.yaml(N); do
+    [[ ${f:t} == vars.yaml ]] && continue
+    content=$(<$f)
+    for p in $pairs; do
+      k=${p%%=*} v=${p#*=}
+      content=${content//"\$($k)"/$v}
+    done
+    print -r -- $content >$out/${f:t}
+    if grep -qE '\$\([A-Za-z0-9_.]+\)' $out/${f:t}; then
+      err "Variables sin valor en ${f:t}:"
+      grep -noE '\$\([A-Za-z0-9_.]+\)' $out/${f:t} | sed 's/^/   /' >&2
+      pend=1
+    fi
+  done
+  (( pend )) && { err "Agrega las variables faltantes al bloque '$env' de $vars"; return 1 }
+  ok "Plantillas renderizadas en $out"
+}
+
 # ---------------------------------------------------------------- acciones
 cmd_up() {
   title "Levantando ambiente"
   if ! docker network inspect $NETWORK >/dev/null 2>&1; then
-    step "Creando red $NETWORK" docker network create --subnet 172.18.0.0/16 --gateway 172.18.0.1 $NETWORK || return 1
+    step "Creando red $NETWORK" docker network create --subnet $SUBNET --ip-range $IP_RANGE \
+      --gateway 172.18.0.1 $NETWORK || return 1
   fi
- 
-  step "Levantando Floci" docker compose -f $LOCAL_ENV/compose.yaml up -d || return 1
+
+  step "Levantando Floci" docker compose -f $(compose_file) up -d || return 1
   step "Esperando a Floci" zsh -c 'for i in {1..30}; do curl -s localhost:4566 >/dev/null && exit 0; sleep 1; done; exit 1' || return 1
- 
+
   if k3d cluster list $CLUSTER >/dev/null 2>&1; then
     cluster_running || step "Iniciando clúster $CLUSTER" k3d cluster start $CLUSTER || return 1
   else
@@ -83,36 +271,42 @@ cmd_up() {
       --k3s-arg "--disable=traefik@server:*" --wait || return 1
   fi
   kubectl config use-context k3d-$CLUSTER >/dev/null
- 
-  kubectl get namespace local >/dev/null 2>&1 || step "Creando namespace local" kubectl create namespace local
-  step "Conectando clúster con Floci" kubectl apply -f $LOCAL_ENV/floci-service.yaml || return 1
- 
-  ok "Listo · Floci: http://localhost:4566 · Floci UI: http://localhost:4500"
+  ensure_namespace local || return 1
+
+  ok "Listo · Floci: $FLOCI · Floci UI: http://localhost:4500"
 }
- 
+
 deploy() {   # $1 = build | nobuild
-  load_app || return 1
+  need_project || return 1
   cluster_running || { err "El clúster no está corriendo. Usa 'Levantar ambiente' primero."; return 1 }
   title "Desplegando $APP"
- 
+
   if [[ $1 == build ]]; then
-    if [[ -x $PROJECT/gradlew ]]; then
-      step "Compilando con Gradle" $PROJECT/gradlew -p $PROJECT build -x test || return 1
+    if [[ -x $PROJECT/gradlew && -n $GRADLE_TASK && $GRADLE_TASK != false ]]; then
+      step "Compilando con Gradle ($GRADLE_TASK)" $PROJECT/gradlew -p $PROJECT ${=GRADLE_TASK} || return 1
     fi
-    step "Construyendo imagen $IMAGE" docker build -t $IMAGE $PROJECT || return 1
+    (( $#BUILD_ARGS )) && dim "  build args: ${BUILD_ARGS#--build-arg=}"
+    step "Construyendo imagen $IMAGE" docker build -f $PROJECT/$DOCKERFILE $BUILD_ARGS -t $IMAGE $PROJECT || return 1
     step "Importando imagen a k3d" k3d image import $IMAGE -c $CLUSTER || return 1
   fi
- 
-  step "Rellenando plantillas de k8s/" $LOCAL_ENV/render.sh $K8S local $PROJECT/.rendered/local || return 1
- 
-  if ! kubectl get namespace $NS >/dev/null 2>&1; then
-    step "Creando namespace $NS" kubectl create namespace $NS
-    warn "Namespace nuevo: aplica floci-service.yaml en '$NS' para que la app vea a Floci"
+
+  local out=$PROJECT/.rendered/local
+  step "Rellenando plantillas de k8s/" $SELF render $K8S local $out || return 1
+
+  # Marca de tiempo en el pod template: cada apply produce UN rollout que toma la
+  # imagen nueva y los cambios de ConfigMap/Secret (sin un restart aparte).
+  NOW=$(strftime %Y-%m-%dT%H:%M:%S $EPOCHSECONDS) \
+    yq -i '(select(.kind == "Deployment") | .spec.template.metadata.annotations."dev-scripts/restarted-at") = strenv(NOW)' \
+    $out/*.yaml(N)
+  if yq 'select(.kind == "Deployment") | .spec.template.spec.containers[].imagePullPolicy' $out/*.yaml(N) \
+       | grep -q Always; then
+    warn "imagePullPolicy: Always en local → k3d intentará bajar $IMAGE de un registry. Usa IfNotPresent."
   fi
- 
-  step "Aplicando manifiestos" kubectl apply -f $PROJECT/.rendered/local || return 1
-  [[ $1 == build ]] && { step "Reiniciando pod con la imagen nueva" kubectl rollout restart $DEPLOY -n $NS || return 1 }
- 
+
+  ensure_namespace $NS || return 1
+  step "Aplicando manifiestos" kubectl apply -f $out || return 1
+  grep -v unchanged $LOG | sed 's/^/  /'
+
   if step "Esperando a que el pod quede listo" kubectl rollout status $DEPLOY -n $NS --timeout=300s; then
     ok "$APP desplegado"
   else
@@ -123,78 +317,233 @@ deploy() {   # $1 = build | nobuild
 }
 cmd_deploy() { deploy build }
 cmd_apply()  { deploy nobuild }
- 
+
+cmd_project() { pick_project && ok "Proyecto: $APP ($PROJECT)" }
+
 cmd_status() {
-  load_app || return 1
+  need_project || return 1
   title "Estado de $APP"
   kubectl get deploy,pods,svc,hpa -n $NS -l app=$APP 2>/dev/null || kubectl get all -n $NS
   echo
   kubectl get events -n $NS --sort-by=.lastTimestamp 2>/dev/null | tail -n 8
 }
- 
-cmd_logs() {
-  load_app || return 1
-  title "Logs de $APP (Ctrl+C para salir)"
-  kubectl logs -f -n $NS -l app=$APP --all-containers --tail=100
+
+cmd_overview() {
+  title "Proyectos en $PROJECTS_DIR"
+  local name app ns ready; local -a v
+  printf '  %-28s %-14s %s\n' PROYECTO NAMESPACE LISTOS
+  for name in $(list_projects); do
+    v=("${(@f)$(yq '.local | (.appName // "", .namespace // "local")' $PROJECTS_DIR/$name/k8s/vars.yaml)}")
+    app=$v[1] ns=$v[2]
+    ready=$(kubectl get deploy $app-deploy -n $ns \
+      -o jsonpath='{.status.readyReplicas}/{.spec.replicas}' 2>/dev/null) || ready="—"
+    [[ $ready == /* ]] && ready="0$ready"
+    printf '  %-28s %-14s %s\n' "$name$([[ $app == $APP ]] && print ' ◀')" $ns $ready
+  done
 }
- 
+
+cmd_logs() {
+  need_project || return 1
+  title "Logs de $APP (Ctrl+C para salir)"
+  kubectl logs -f -n $NS -l app=$APP --all-containers --prefix --max-log-requests 10 --tail=100
+}
+
 cmd_forward() {
-  load_app || return 1
-  local lp=$(gum input --header "Puerto local" --value $PORT) || return
+  need_project || return 1
+  local lp
+  lp=$(gum input --header "Puerto local" --value $PORT) || return
   ok "http://localhost:$lp → $APP:$PORT   (Ctrl+C para cortar)"
   kubectl port-forward -n $NS $DEPLOY $lp:$PORT
 }
- 
+
 cmd_aws() {
   title "Recursos en Floci"
-  local a="aws --profile floci --output text"
-  gum style --bold "SQS";             $a sqs list-queues --query 'QueueUrls[]' 2>/dev/null | tr '\t' '\n' | sed 's/^/  /'
-  gum style --bold "DynamoDB";        $a dynamodb list-tables --query 'TableNames[]' 2>/dev/null | tr '\t' '\n' | sed 's/^/  /'
-  gum style --bold "S3";              $a s3 ls 2>/dev/null | sed 's/^/  /'
-  gum style --bold "Secrets Manager"; $a secretsmanager list-secrets --query 'SecretList[].Name' 2>/dev/null | tr '\t' '\n' | sed 's/^/  /'
-  gum style --bold "Lambda";          $a lambda list-functions --query 'Functions[].FunctionName' 2>/dev/null | tr '\t' '\n' | sed 's/^/  /'
-  gum style --foreground 245 "Vista web: http://localhost:4500"
+  local -a a=(aws --profile floci --output text)
+  _list() { gum style --bold $1; shift; "$@" 2>/dev/null | tr '\t' '\n' | sed '/^$/d; s/^/  /' }
+  _list "SQS"             $a sqs list-queues --query 'QueueUrls[]'
+  _list "SNS"             $a sns list-topics --query 'Topics[].TopicArn'
+  _list "DynamoDB"        $a dynamodb list-tables --query 'TableNames[]'
+  _list "S3"              $a s3api list-buckets --query 'Buckets[].Name'
+  _list "Secrets Manager" $a secretsmanager list-secrets --query 'SecretList[].Name'
+  _list "SSM"             $a ssm describe-parameters --query 'Parameters[].Name'
+  _list "Lambda"          $a lambda list-functions --query 'Functions[].FunctionName'
+  _list "API Gateway ($API_ID)" $a apigateway get-resources --rest-api-id $API_ID --query 'items[?resourceMethods].path'
+  dim "Vista web: http://localhost:4500"
 }
- 
+
 cmd_pause() {
   title "Pausando ambiente (se conserva todo)"
   step "Deteniendo clúster" k3d cluster stop $CLUSTER
-  step "Deteniendo Floci" docker compose -f $LOCAL_ENV/compose.yaml stop
+  step "Deteniendo Floci" docker compose -f $(compose_file) stop
 }
- 
+
 cmd_destroy() {
-  gum confirm --default=false "¿Eliminar el clúster k3d? (Floci y sus datos se conservan)" || return 0
+  local what
+  what=$(gum choose --header "¿Qué eliminar?" "Solo el clúster k3d" \
+    "Clúster + contenedor Floci (conserva datos)" "Todo, incluidos los datos de Floci" "Cancelar") || return 0
+  [[ $what == Cancelar ]] && return 0
+  gum confirm --default=false "$what. ¿Seguro?" || return 0
   step "Eliminando clúster" k3d cluster delete $CLUSTER
+  case $what in
+    Clúster*) step "Eliminando Floci" docker compose -f $(compose_file) down ;;
+    Todo*)    step "Eliminando Floci y sus datos" docker compose -f $(compose_file) down -v ;;
+  esac
 }
- 
+
+cmd_log() { [[ -s $LOG ]] && gum pager <$LOG || warn "Aún no hay log" }
+
+# ---------------------------------------------------------------- API Gateway (antes apigw.sh)
+# Reconstruye el API completo con el mismo ID en cada ejecución, así la URL no cambia:
+#   http://localhost:4566/restapis/local/local/_user_request_/<ruta>
+awsf() {  # AWS CLI contra Floci; en DRY_RUN solo imprime y devuelve un ID falso
+  if [[ $DRY_RUN == 1 ]]; then
+    print -r -- "  aws $*" >&2; print "id${EPOCHREALTIME#*.}"
+  else
+    aws --profile floci --output text "$@"
+  fi
+}
+
+cmd_apigw() {
+  local -a files=($ROUTES_DIR/*.yaml(N))
+  (( $#files )) || { err "No hay archivos de rutas en $ROUTES_DIR"; return 1 }
+  local node=k3d-$CLUSTER-server-0   # alcanzable desde Floci por la red $NETWORK
+
+  # validación
+  local -A seen_port seen_route
+  local f app port m p key
+  for f in $files; do
+    app=$(yq '.app // ""' $f) port=$(yq '.localPort // ""' $f)
+    [[ -n $app && -n $port ]] || { err "${f:t}: faltan 'app' o 'localPort'"; return 1 }
+    [[ -z ${seen_port[$port]} ]] || { err "localPort $port repetido en ${f:t} y ${seen_port[$port]}"; return 1 }
+    seen_port[$port]=${f:t}
+    while IFS=$'\t' read -r m p; do
+      key="$m $p"
+      [[ -z ${seen_route[$key]} ]] || { err "Ruta duplicada '$key' en ${f:t} y ${seen_route[$key]}"; return 1 }
+      seen_route[$key]=${f:t}
+    done < <(yq '.routes[] | [(.method | upcase), .path] | @tsv' $f)
+  done
+
+  # 1) Services LoadBalancer para que Floci llegue a cada app por el nodo k3d
+  title "Publicando API Gateway '$API_ID'"
+  local manifest=$CACHE/apigw-services.yaml
+  : >$manifest
+  for f in $files; do
+    yq '{"apiVersion": "v1", "kind": "Service",
+         "metadata": {"name": .app + "-apigw", "namespace": (.namespace // "local"),
+                      "labels": {"dev-scripts/apigw": "true"}},
+         "spec": {"type": "LoadBalancer", "selector": {"app": .app},
+                  "ports": [{"name": "http", "port": .localPort, "targetPort": (.containerPort // 8080)}]}}
+        | split_doc' $f >>$manifest
+    print -- --- >>$manifest
+  done
+  if [[ $DRY_RUN == 1 ]]; then cat $manifest
+  else step "Exponiendo microservicios" kubectl apply -f $manifest || return 1
+  fi
+
+  # 2) API Gateway
+  [[ $DRY_RUN == 1 ]] || aws --profile floci apigateway delete-rest-api --rest-api-id $API_ID >/dev/null 2>&1
+  awsf apigateway create-rest-api --name local-gateway --endpoint-configuration types=REGIONAL \
+    --tags "{\"floci:override-id\":\"$API_ID\"}" --query id >/dev/null || return 1
+
+  local -A RES
+  local RID
+  if [[ $DRY_RUN == 1 ]]; then RES[/]=root
+  else RES[/]=$(aws --profile floci --output text apigateway get-resources --rest-api-id $API_ID --query "items[?path=='/'].id")
+  fi
+
+  # Crea (si falta) cada segmento de la ruta; deja el ID en RID
+  ensure_resource() {   # ojo: no usar "path" como nombre (en zsh es $PATH)
+    local rpath=$1
+    if [[ -n ${RES[$rpath]} ]]; then RID=${RES[$rpath]}; return; fi
+    local parent=${rpath%/*}; [[ -z $parent ]] && parent=/
+    ensure_resource $parent
+    RID=$(awsf apigateway create-resource --rest-api-id $API_ID --parent-id $RID \
+          --path-part ${rpath##*/} --query id)
+    RES[$rpath]=$RID
+  }
+
+  local method target seg name; local -a out mparams iparams mextra iextra
+  for f in $files; do
+    port=$(yq '.localPort' $f)
+    while IFS=$'\t' read -r method p target; do
+      ensure_resource $p
+
+      # Parámetros de ruta: {channelId} o {proxy+} → se pasan tal cual al backend
+      mparams=() iparams=() mextra=() iextra=()
+      for seg in ${(s:/:)p}; do
+        [[ $seg == \{*\} ]] || continue
+        name=${${seg#\{}%\}}; name=${name%+}
+        mparams+="\"method.request.path.$name\":true"
+        iparams+="\"integration.request.path.$name\":\"method.request.path.$name\""
+      done
+      if (( $#mparams )); then
+        mextra=(--request-parameters "{${(j:,:)mparams}}")
+        iextra=(--request-parameters "{${(j:,:)iparams}}")
+      fi
+
+      awsf apigateway put-method --rest-api-id $API_ID --resource-id $RID \
+        --http-method $method --authorization-type NONE $mextra >/dev/null || return 1
+      awsf apigateway put-integration --rest-api-id $API_ID --resource-id $RID \
+        --http-method $method --type HTTP_PROXY --integration-http-method $method \
+        --uri "http://$node:$port$target" $iextra >/dev/null || return 1
+
+      out+="$(printf '%-7s %s' $method "$FLOCI/restapis/$API_ID/$STAGE/_user_request_$p")"
+    done < <(yq '.routes[] | [(.method | upcase), .path, (.target // .path)] | @tsv' $f)
+  done
+
+  awsf apigateway create-deployment --rest-api-id $API_ID --stage-name $STAGE >/dev/null || return 1
+  ok "API Gateway publicado. Rutas:"
+  print -rl -- "  "$^out
+}
+
+cmd_help() { sed -n '2,/^$/p' $SELF | sed 's/^# \{0,1\}//' }
+
 # ---------------------------------------------------------------- entrada
-check_tools
- 
+OPT_PROJECT=
+while [[ $1 == -* ]]; do
+  case $1 in
+    -p|--project) OPT_PROJECT=$2; shift 2 ;;
+    -h|--help)    set -- help ;;
+    *) err "Opción desconocida: $1"; exit 1 ;;
+  esac
+done
+
+case $1 in
+  help)   cmd_help; exit 0 ;;
+  render) check_tools yq; shift; cmd_render "$@"; exit $? ;;
+esac
+
+check_tools docker k3d kubectl yq gum aws curl
+resolve_project || exit 1
+
 if [[ -n $1 ]]; then
-  (( $+functions[cmd_$1] )) || { err "Acción desconocida: $1"; exit 1 }
-  cmd_$1; exit $?
+  (( $+functions[cmd_$1] )) || { err "Acción desconocida: $1 (dev help)"; exit 1 }
+  cmd_$1 "${@:2}"; exit $?
 fi
- 
-typeset -A ACTIONS=(
-  "🚀 Levantar ambiente"            up
-  "📦 Compilar y desplegar app"     deploy
-  "📝 Aplicar solo manifiestos"     apply
-  "📊 Estado"                        status
-  "📜 Logs"                          logs
-  "🔌 Port-forward"                  forward
-  "☁  Ver recursos en Floci"        aws
-  "⏸  Pausar ambiente"              pause
-  "🗑  Eliminar clúster"             destroy
+
+MENU=(
+  "🚀 Levantar ambiente|up"
+  "📦 Compilar y desplegar app|deploy"
+  "📝 Aplicar manifiestos (reinicia pods)|apply"
+  "🌐 Publicar API Gateway|apigw"
+  "📊 Estado|status"
+  "🗂  Resumen de proyectos|overview"
+  "📜 Logs|logs"
+  "🔌 Port-forward|forward"
+  "☁  Ver recursos en Floci|aws"
+  "🔀 Cambiar proyecto|project"
+  "📄 Ver último log|log"
+  "⏸  Pausar ambiente|pause"
+  "🗑  Eliminar|destroy"
+  "👋 Salir|exit"
 )
-ORDER=("🚀 Levantar ambiente" "📦 Compilar y desplegar app" "📝 Aplicar solo manifiestos"
-       "📊 Estado" "📜 Logs" "🔌 Port-forward" "☁  Ver recursos en Floci"
-       "⏸  Pausar ambiente" "🗑  Eliminar clúster" "👋 Salir")
- 
+
 while true; do
   header
-  choice=$(gum choose --cursor "➜ " --height 12 $ORDER) || break
-  [[ $choice == "👋 Salir" ]] && break
-  cmd_${ACTIONS[$choice]}
+  choice=$(gum choose --cursor "➜ " --height 16 ${MENU%%\|*}) || break
+  for m in $MENU; do [[ ${m%%\|*} == $choice ]] && { action=${m##*\|}; break } done
+  [[ $action == exit ]] && break
+  cmd_$action
   echo; gum input --placeholder "Enter para volver al menú" >/dev/null || break
   clear
 done

@@ -1,39 +1,44 @@
 #!/usr/bin/env zsh
+# 🌿 Crea una rama con prefijo (feature/, bugfix/...) desde la base actualizada o la rama actual
+source ${0:A:h}/lib/ui.zsh
+require_repo
+banner "🌿 Crear Rama"
 
-gum style \
-    --foreground 2 --border rounded --padding "1 2" \
-    "🌿 Crear Rama"
+CURRENT=$(git branch --show-current)
+BASE=$(base_branch)
 
-if ! git rev-parse --git-dir > /dev/null 2>&1; then
-    gum style --foreground 1 "✗ No estás en un repositorio git"
-    exit 1
-fi
+PREFIX=$(gum choose --header "🏷  Tipo de rama" ${=${BRANCH_PREFIXES:-feature bugfix hotfix release chore}} "(sin prefijo)") || cancel
+[[ $PREFIX == "(sin prefijo)" ]] && PREFIX=""
 
-CURRENT_BRANCH=$(git branch --show-current)
+NAME=$(gum input --header "📝 Nombre" --placeholder "1234-descripcion-corta") || cancel
+NAME=${${NAME// /-}//[^A-Za-z0-9._\/-]/}      # espacios → guiones, sin caracteres inválidos
+[[ -n $NAME ]] || cancel
+NEW=${PREFIX:+$PREFIX/}$NAME
 
-NEW_BRANCH=$(gum input \
-    --placeholder "Nombre de la nueva rama local")
+git check-ref-format --branch $NEW >/dev/null 2>&1 || { err "Nombre de rama inválido: $NEW"; exit 1 }
+git show-ref -q --verify refs/heads/$NEW && { err "La rama $NEW ya existe localmente"; exit 1 }
+git show-ref -q --verify refs/remotes/origin/$NEW && warn "Ya existe origin/$NEW (git-switch la trae)"
 
-if [ -z "$NEW_BRANCH" ]; then
-    gum style --foreground 3 "⚠ Operación cancelada"
-    exit 0
-fi
+local -a opts
+[[ -n $BASE ]] && opts+="origin/$BASE (actualizada)"
+[[ -n $CURRENT && $CURRENT != $BASE ]] && opts+="$CURRENT (rama actual)"
+opts+="Otra rama..."
+FROM=$(gum choose --header "📍 Crear desde" $opts) || cancel
 
-gum spin \
-    --spinner dot \
-    --title "Creando rama..." \
-    -- git switch -c "$NEW_BRANCH"
+case $FROM in
+  origin/*)
+    run "Actualizando origin/$BASE" timeout 30 git fetch origin $BASE || exit 1
+    START=origin/$BASE ;;
+  "Otra rama...")
+    START=$(git for-each-ref --sort=-committerdate --format='%(refname:short)' refs/heads refs/remotes \
+      | grep -v '/HEAD$' | gum filter --header "📍 Rama base") || cancel ;;
+  *) START=$CURRENT ;;
+esac
 
-if [ $? -eq 0 ]; then
-    gum style \
-        --foreground 2 \
-        "✓ Rama creada: $NEW_BRANCH"
+is_dirty && dim "Tus cambios sin commit se llevan a la rama nueva."
+run "Creando $NEW desde $START" git switch -c $NEW --no-track $START || exit 1
+ok "Rama creada: $NEW"
+info "📍 Basada en: $START"
 
-    gum style \
-        --foreground 6 \
-        "📍 Basada en: $CURRENT_BRANCH"
-else
-    gum style \
-        --foreground 1 \
-        "✗ No fue posible crear la rama"
-fi
+gum confirm --default=false "¿Publicarla ya en origin?" && run "Publicando" git push -u origin $NEW && ok "Publicada: origin/$NEW"
+exit 0
