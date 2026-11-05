@@ -1,0 +1,104 @@
+#!/usr/bin/env zsh
+# 🧰 ds — índice de todos los scripts de dev-scripts (por si se te olvida alguno)
+#
+# Uso:
+#   ds                   menú: busca un script y lo ejecuta en la carpeta actual
+#   ds ls                lista todos, agrupados, con su descripción
+#   ds <script> [args]   ejecuta uno (ej: ds dev deploy · ds git-commit)
+#   ds install           crea accesos en ~/.local/bin para llamarlos sin ds (dev, git-commit…)
+#
+# Un script nuevo en esta carpeta aparece solo: su descripción es la 2ª línea ("# …").
+
+DIR=${0:A:h}
+BIN=${DS_BIN:-$HOME/.local/bin}
+
+# Grupos y descripciones conocidas (un script que no esté aquí va a "Otros")
+GROUPS=(
+  "Ambiente local|dev docker-start"
+  "Git|git-status git-branch git-switch git-commit git-push git-mergeback git-history"
+  "Spring / Gradle|spring-new gradle-run"
+)
+typeset -A DESC=(
+  dev           "☁  Ambiente local k3d + Floci: encender/apagar, desplegar, recursos AWS, API Gateway"
+  docker-start  "🐳 Inicia Docker en WSL2"
+  git-status    "📊 Estado del repo: rama, sincronía con el remoto, archivos"
+  git-branch    "🌿 Crea una rama nueva"
+  git-switch    "🔀 Cambia de rama (locales y remotas)"
+  git-commit    "📝 Commit convencional (tipo: mensaje)"
+  git-push      "🚀 Push de la rama actual"
+  git-mergeback "🔁 Integra la rama actual en otra"
+  git-history   "📚 Historial: log, archivo, commit, búsqueda, blame"
+  spring-new    "🍃 Nuevo proyecto Spring Boot"
+  gradle-run    "🐘 Menú de tasks de Gradle (build, bootRun, test, Sonar)"
+)
+
+# Scripts de la carpeta: ejecutables, sin README, ds, lib/ ni stack/. dev.zsh → "dev"
+typeset -A FILE
+scan() {
+  local f name
+  for f in $DIR/*(N.x); do
+    name=${f:t}
+    [[ $name == (ds|README*|*.md|*.yaml|*.example) ]] && continue
+    name=${name%.zsh}; name=${name%.sh}
+    FILE[$name]=$f
+    if [[ -z ${DESC[$name]} ]]; then      # descripción: 2ª línea "# …" del script
+      DESC[$name]=$(sed -n '2s/^#[[:space:]]*//p' $f)
+    fi
+  done
+}
+
+ordered() {  # imprime "grupo<TAB>nombre" en orden, con los no agrupados en "Otros"
+  local g n; local -a seen=()
+  for g in $GROUPS; do
+    for n in ${=g#*|}; do
+      (( ${+FILE[$n]} )) && { print -r -- "${g%%|*}	$n"; seen+=$n }
+    done
+  done
+  for n in ${(ko)FILE}; do (( ${seen[(Ie)$n]} )) || print -r -- "Otros	$n"; done
+}
+
+cmd_ls() {
+  local line g n last=""
+  for line in ${(f)"$(ordered)"}; do
+    g=${line%%	*} n=${line#*	}
+    [[ $g != $last ]] && { [[ -n $last ]] && echo; gum style --bold --foreground 212 "$g"; last=$g }
+    printf '  %-15s %s\n' $n "${DESC[$n]:-(sin descripción)}"
+  done
+  echo
+  gum style --foreground 245 "ds <script> para ejecutar · ds install para llamarlos sin ds"
+}
+
+cmd_install() {
+  mkdir -p $BIN
+  local n made=0
+  for n in ${(k)FILE}; do
+    [[ -e $BIN/$n && ! -L $BIN/$n ]] && { gum style --foreground 214 "! $BIN/$n ya existe y no es un acceso de ds: lo dejo"; continue }
+    ln -sf $FILE[$n] $BIN/$n && (( made++ ))
+  done
+  ln -sf $DIR/ds $BIN/ds
+  gum style --foreground 42 "✔ $made accesos en ${BIN/#$HOME/~} (+ ds)"
+  [[ :$PATH: == *:$BIN:* ]] || gum style --foreground 214 "! ${BIN/#$HOME/~} no está en tu PATH. Agrega a ~/.zshrc: export PATH=\"$BIN:\$PATH\""
+  gum style --foreground 245 "Si tenías alias (alias dev=…), puedes quitarlos de ~/.zshrc."
+}
+
+run() {  # nombre args…
+  local n=$1; shift
+  (( ${+FILE[$n]} )) || { gum style --foreground 196 "✘ No existe el script '$n'. Mira: ds ls"; exit 1 }
+  exec $FILE[$n] "$@"
+}
+
+scan
+case $1 in
+  ls|list)       cmd_ls ;;
+  install)       cmd_install ;;
+  -h|--help|help) sed -n '2,/^$/p' ${0:A} | sed 's/^# \{0,1\}//' ;;
+  "")
+    items=() 
+    for line in ${(f)"$(ordered)"}; do       # "nombre  descripción  · grupo" (el grupo también se busca)
+      items+="$(printf '%-15s %s  · %s' "${line#*	}" "${DESC[${line#*	}]}" "${line%%	*}")"
+    done
+    sel=$(print -rl -- $items | gum filter --header "🧰 dev-scripts · ¿qué quieres hacer? (escribe para buscar)" \
+          --placeholder "commit, rama, desplegar, gradle…" --height 20) || exit 0
+    [[ -n $sel ]] && run ${sel%% *} ;;
+  *)             run "$@" ;;
+esac
