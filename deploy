@@ -6,32 +6,50 @@
 #   dev [-p proyecto] <acción>       acción directa
 #
 # Acciones:
-#   up        levanta red, Floci y clúster k3d
+#   on  [all|floci|k3d]          enciende (y arranca Docker si hace falta)
+#   off [all|floci|k3d|docker]   apaga sin borrar nada; 'docker' también apaga Docker
+#   power                        interruptor: ofrece encender/apagar según el estado
 #   deploy    compila (Gradle), construye imagen, importa a k3d y aplica manifiestos
 #   apply     solo renderiza y aplica manifiestos (reinicia pods igual)
-#   apigw     publica el API Gateway REST en Floci desde local-env/api/routes.d/*.yaml
 #   status    estado del proyecto actual         overview  resumen de todos los proyectos
 #   logs      logs del pod                       forward   port-forward
-#   aws       recursos en Floci                  pause     detiene sin borrar nada
+#   diagnose  por qué el pod no arranca (motivo, eventos, logs del intento anterior)
 #   destroy   elimina clúster (y opcionalmente Floci)
 #   render <dir_k8s> [ambiente] [salida]         rellena $(variables) desde vars.yaml
 #   help
 #
+# Recursos AWS simulados en Floci (stack/aws/<proyecto>.yaml):
+#   aws                 submenú        aws ls      ver recursos (mensajes, ítems, de qué archivo)
+#   aws apply [arch…]   crea lo que falta de los archivos (sin argumentos: elegir)
+#   aws new             crear uno con formulario y guardarlo en un archivo
+#   aws rm              eliminar: elegidos, los de un archivo o todo
+#   aws test            enviar/ver/consumir/purgar mensajes, publicar en SNS, ver ítems y valores
+#
+# API Gateway (stack/apigw/<proyecto>.yaml):
+#   apigw               submenú        apigw ls    rutas publicadas y diferencias
+#   apigw publish [arch…]  publica archivos completos (sin argumentos: elegir archivos o rutas)
+#   apigw rm            quitar rutas sueltas, las de un archivo o todo   ·   apigw clear
+#
 # Proyecto: -p <nombre|ruta>, si no la carpeta actual (si tiene k8s/vars.yaml),
 #           si no el último usado. Los proyectos se buscan en $DEV_PROJECTS (~/projects).
 #
-# Variables: CLUSTER (local) · DEV_PROJECTS · FLOCI_IP (172.18.0.10) · AWS_REGION
+# Variables: CLUSTER (local) · DEV_PROJECTS · DEV_STACK (./stack) · FLOCI_URL · FLOCI_IP (172.18.0.10) · AWS_REGION
+#            FLOCI_IMAGE · K3S_IMAGE (versión de k8s igual a tu EKS) · ROLLOUT_TIMEOUT (300s)
 #            DRY_RUN=1 dev apigw  → muestra lo que haría sin tocar nada
 #
-# Requiere: docker, k3d, kubectl, yq (mikefarah), gum, aws (perfil "floci"), curl
+# Seguridad: kubectl siempre usa --context k3d-$CLUSTER y aws siempre --endpoint-url
+#            de Floci, aunque tu kubectl apunte a EKS o tengas credenciales reales.
+#
+# Requiere: docker, k3d, kubectl, yq (mikefarah ≥ 4.35), gum, aws, curl
 
 setopt pipefail
 zmodload zsh/datetime
 
 SELF=${0:A}
 DEV_HOME=${0:A:h}
-LOCAL_ENV=$DEV_HOME/local-env
-ROUTES_DIR=${ROUTES_DIR:-$LOCAL_ENV/api/routes.d}
+STACK=${DEV_STACK:-$DEV_HOME/stack}          # infraestructura: aws/, apigw/, floci/
+AWS_DIR=$STACK/aws                             # recursos AWS por proyecto
+ROUTES_DIR=${ROUTES_DIR:-$STACK/apigw}         # rutas del API Gateway por proyecto
 PROJECTS_DIR=${DEV_PROJECTS:-$HOME/projects}
 CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/dev
 LOG=$CACHE/last.log
@@ -41,11 +59,21 @@ NETWORK=${NETWORK:-aws-local}
 SUBNET=172.18.0.0/16
 IP_RANGE=172.18.128.0/17          # IPs dinámicas (k3d) lejos de las fijas (Floci = .10)
 FLOCI_IP=${FLOCI_IP:-172.18.0.10}
-FLOCI=http://localhost:4566
+FLOCI=${FLOCI_URL:-http://localhost:4566}
 REGION=${AWS_REGION:-us-east-1}
-API_ID=${API_ID:-local}
+API_ID_SET=$API_ID; API_ID=${API_ID:-local}
 STAGE=${STAGE:-local}
 DRY_RUN=${DRY_RUN:-0}
+FLOCI_IMAGE=${FLOCI_IMAGE:-floci/floci:latest}
+K3S_IMAGE=${K3S_IMAGE:-}                 # ej: rancher/k3s:v1.32.5-k3s1 (igual a la versión de tu EKS)
+ROLLOUT_TIMEOUT=${ROLLOUT_TIMEOUT:-300s}
+
+# Seguridad: todo kubectl va al clúster k3d y todo aws a Floci, sin importar el
+# contexto actual de kubectl ni AWS_PROFILE/credenciales reales en el entorno.
+KCTX=k3d-$CLUSTER
+K=(kubectl --context $KCTX)
+AWSL=(env -u AWS_PROFILE -u AWS_SESSION_TOKEN AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_PAGER=
+      aws --endpoint-url $FLOCI --region $REGION --output text)   # AWS_PAGER vacío: el CLI v2 no abre less
 
 mkdir -p $CACHE
 
@@ -66,7 +94,7 @@ step() {
     ok $msg
   else
     err "$msg falló:"
-    tail -n 25 $LOG | gum style --foreground 245 --padding "0 2"
+    [[ -s $LOG ]] && tail -n 25 $LOG | gum style --foreground 245 --padding "0 2"
     dim "Log completo: $LOG"
     return 1
   fi
@@ -76,7 +104,7 @@ check_tools() {
   local t; local -a missing
   for t in "$@"; do (( $+commands[$t] )) || missing+=$t; done
   (( $#missing == 0 )) || { err "Faltan herramientas: $missing"; exit 1 }
-  yq --version 2>/dev/null | grep -q mikefarah || { err "Necesito el yq de mikefarah (el de apt es otro programa)."; exit 1 }
+  [[ $(yq --version 2>/dev/null) == *mikefarah* ]] || { err "Necesito el yq de mikefarah (el de apt es otro programa)."; exit 1 }
 }
 
 # ---------------------------------------------------------------- proyectos
@@ -87,10 +115,10 @@ load_app() {
   local -a v
   v=("${(@f)$(yq '.local | (.appName // "", .namespace // "local", .containerPort // 8080,
                 .repository // .appName // "", .imageTag // "local", .dockerfile // "Dockerfile",
-                .gradleTask // "build -x test")' $VARS)}")
+                .gradleTask // "build -x test", .deploymentName // .appName + "-deploy")' $VARS)}")
   APP=$v[1] NS=$v[2] PORT=$v[3] IMAGE="$v[4]:$v[5]" DOCKERFILE=$v[6] GRADLE_TASK=$v[7]
   [[ -n $APP ]] || { err "Falta local.appName en $VARS"; return 1 }
-  DEPLOY="deployment/$APP-deploy"
+  DEPLOY="deployment/$v[8]"
   # dockerBuildArgs: mapa {CLAVE: valor} o lista ["CLAVE=valor"]
   BUILD_ARGS=(${(f)"$(yq '.local.dockerBuildArgs // {} |
       ((select(tag == "!!map") | to_entries | .[] | .key + "=" + (.value | to_string)),
@@ -126,27 +154,48 @@ resolve_project() {  # -p > carpeta actual > último usado
 
 need_project() { [[ -n $APP ]] || pick_project }
 
-cluster_running() { docker ps --format '{{.Names}}' | grep -q "^k3d-$CLUSTER-server-0$" }
-floci_running()   { docker ps --format '{{.Names}}' | grep -q '^floci$' }
+# Sin "| grep -q": con pipefail, grep -q corta la tubería (SIGPIPE) y da falso negativo
+running_containers() { docker ps --format '{{.Names}}' 2>/dev/null }
+cluster_running() { local -a n=(${(f)"$(running_containers)"}); (( ${n[(Ie)k3d-$CLUSTER-server-0]} )) }
+
+# Clúster corriendo y su contexto presente (p. ej. si `aws eks update-kubeconfig`
+# o alguien reescribió ~/.kube/config, se vuelve a fusionar sin tocar el contexto actual)
+need_cluster() {
+  cluster_running || { err "El clúster '$CLUSTER' no está encendido. Usa ⏻ Encender (dev on)."; return 1 }
+  kubectl config get-contexts $KCTX >/dev/null 2>&1 && return 0
+  step "Recuperando contexto $KCTX" k3d kubeconfig merge $CLUSTER --kubeconfig-merge-default --kubeconfig-switch-context=false
+}
+
+# Ejecuta sin spinner ni salida; solo habla si falla
+quiet() {
+  local msg=$1; shift
+  "$@" >$LOG 2>&1 && return 0
+  err "$msg falló:"; tail -n 15 $LOG | sed 's/^/  /' >&2
+  return 1
+}
+floci_running()   { local -a n=(${(f)"$(running_containers)"}); (( ${n[(Ie)floci]} )) }
 
 header() {
-  local cl fl app=""
-  cluster_running && cl="🟢 k3d" || cl="🔴 k3d"
-  floci_running   && fl="🟢 Floci" || fl="🔴 Floci"
+  local dk="🔴 Docker" cl="🔴 k3d" fl="🔴 Floci" app=""
+  if docker_running; then
+    dk="🟢 Docker"
+    cluster_running && cl="🟢 k3d"
+    floci_running   && fl="🟢 Floci"
+  fi
   [[ -n $APP ]] && app="  ·  📦 $APP → ns $NS" || app="  ·  📦 (sin proyecto)"
   gum style --border rounded --border-foreground 212 --padding "0 2" --margin "1 0" \
-    "$(title '☁  Ambiente local')" "$cl   $fl$app"
+    "$(title '☁  Ambiente local')" "$dk   $fl   $cl$app"
 }
 
 # ---------------------------------------------------------------- archivos embebidos
-# compose de Floci: usa local-env/compose.yaml si existe, si no este por defecto
+# compose de Floci: usa stack/floci/compose.yaml si existe, si no este por defecto
 compose_file() {
-  if [[ -f $LOCAL_ENV/compose.yaml ]]; then print -r -- $LOCAL_ENV/compose.yaml; return; fi
+  if [[ -f $STACK/floci/compose.yaml ]]; then print -r -- $STACK/floci/compose.yaml; return; fi
   cat >$CACHE/compose.yaml <<EOF
 name: floci
 services:
   floci:
-    image: floci/floci:latest
+    image: $FLOCI_IMAGE
     container_name: floci
     user: root
     restart: unless-stopped
@@ -212,8 +261,8 @@ EOF
 }
 
 ensure_namespace() {  # $1 = namespace: lo crea y le conecta Floci
-  kubectl get namespace $1 >/dev/null 2>&1 || step "Creando namespace $1" kubectl create namespace $1 || return 1
-  step "Conectando namespace $1 con Floci" kubectl apply -f $(floci_manifest $1)
+  $K get namespace $1 >/dev/null 2>&1 || step "Creando namespace $1" $K create namespace $1 || return 1
+  quiet "Conectar namespace $1 con Floci" $K apply -f $(floci_manifest $1)
 }
 
 # ---------------------------------------------------------------- render (antes render.sh)
@@ -253,39 +302,130 @@ cmd_render() {  # $1 dir_k8s  $2 ambiente  $3 salida
   ok "Plantillas renderizadas en $out"
 }
 
-# ---------------------------------------------------------------- acciones
-cmd_up() {
-  title "Levantando ambiente"
-  if ! docker network inspect $NETWORK >/dev/null 2>&1; then
+# ---------------------------------------------------------------- encender / apagar
+docker_running() { docker info >/dev/null 2>&1 }
+floci_up()       { curl -s -o /dev/null --max-time 3 $FLOCI }
+
+start_docker() {
+  docker_running && return 0
+  sudo -v || return 1   # pide la contraseña antes del spinner
+  local -a cmd=(sudo service docker start)
+  [[ $(ps -p 1 -o comm= 2>/dev/null) == systemd ]] && cmd=(sudo systemctl start docker)
+  step "Iniciando Docker" $cmd || return 1
+  step "Esperando al daemon de Docker" zsh -c 'for i in {1..30}; do docker info >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'
+}
+
+start_floci() {
+  local subnet
+  if subnet=$(docker network inspect $NETWORK -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null); then
+    [[ $subnet == $SUBNET ]] || {
+      err "La red $NETWORK existe con subnet $subnet (se esperaba $SUBNET): Floci no podrá usar $FLOCI_IP."
+      dim "Elimínala con 'docker network rm $NETWORK' (primero 'dev destroy') y vuelve a encender."
+      return 1 }
+  else
     step "Creando red $NETWORK" docker network create --subnet $SUBNET --ip-range $IP_RANGE \
       --gateway 172.18.0.1 $NETWORK || return 1
   fi
-
-  step "Levantando Floci" docker compose -f $(compose_file) up -d || return 1
-  step "Esperando a Floci" zsh -c 'for i in {1..30}; do curl -s localhost:4566 >/dev/null && exit 0; sleep 1; done; exit 1' || return 1
-
-  if k3d cluster list $CLUSTER >/dev/null 2>&1; then
-    cluster_running || step "Iniciando clúster $CLUSTER" k3d cluster start $CLUSTER || return 1
-  else
-    step "Creando clúster $CLUSTER" k3d cluster create $CLUSTER --network $NETWORK \
-      --k3s-arg "--disable=traefik@server:*" --wait || return 1
-  fi
-  kubectl config use-context k3d-$CLUSTER >/dev/null
-  ensure_namespace local || return 1
-
-  ok "Listo · Floci: $FLOCI · Floci UI: http://localhost:4500"
+  step "Encendiendo Floci" docker compose -f $(compose_file) up -d || return 1
+  step "Esperando a Floci" zsh -c 'for i in {1..30}; do curl -s -o /dev/null --max-time 2 "$0" && exit 0; sleep 1; done; exit 1' $FLOCI
 }
 
+start_k3d() {
+  if k3d cluster list $CLUSTER >/dev/null 2>&1; then
+    cluster_running || step "Encendiendo clúster $CLUSTER" k3d cluster start $CLUSTER || return 1
+  else
+    step "Creando clúster $CLUSTER" k3d cluster create $CLUSTER --network $NETWORK \
+      ${K3S_IMAGE:+--image=$K3S_IMAGE} --k3s-arg "--disable=traefik@server:*" \
+      --kubeconfig-switch-context=false --wait || return 1
+  fi
+  need_cluster || return 1
+  local cur=$(kubectl config current-context 2>/dev/null)
+  if [[ $cur != $KCTX ]]; then
+    gum confirm --default=false "Tu kubectl apunta a '${cur:-ninguno}'. ¿Cambiarlo a $KCTX (para k9s/kubectl manual)?" \
+      && kubectl config use-context $KCTX >/dev/null && ok "kubectl → $KCTX"
+  fi
+  ensure_namespace local
+}
+
+stop_k3d()   { cluster_running && step "Apagando clúster $CLUSTER" k3d cluster stop $CLUSTER || dim "  k3d ya estaba apagado" }
+stop_floci() { floci_running && step "Apagando Floci" docker compose -f $(compose_file) stop || dim "  Floci ya estaba apagado" }
+stop_docker() {
+  docker_running || { dim "  Docker ya estaba apagado"; return 0 }
+  sudo -v || return 1
+  local -a cmd=(sudo service docker stop)
+  [[ $(ps -p 1 -o comm= 2>/dev/null) == systemd ]] && cmd=(sudo systemctl stop docker docker.socket)
+  step "Apagando Docker" $cmd
+}
+
+# dev on [all|floci|k3d] — enciende Docker si hace falta y luego lo pedido
+cmd_on() {
+  local what=${1:-all}
+  [[ $what == (all|floci|k3d) ]] || { err "Uso: dev on [all|floci|k3d]"; return 1 }
+  title "Encendiendo ${what/all/todo}"
+  start_docker || return 1
+  [[ $what == (all|floci) ]] && { start_floci || return 1 }
+  [[ $what == (all|k3d) ]]   && { start_k3d || return 1 }
+  ok "Listo · Floci: $FLOCI · Floci UI: http://localhost:4500"
+  # Floci recién creado o sin datos persistentes: ofrecer crear lo declarado en stack/aws
+  if [[ $what == (all|floci) && -n $(aws_files) ]] && floci_empty; then
+    gum confirm "Floci no tiene recursos. ¿Crear los de stack/aws/?" && aws_apply $(aws_files)
+  fi
+  return 0
+}
+
+# dev off [all|floci|k3d|docker] — sin argumento pregunta. 'docker' apaga todo y libera memoria de WSL
+cmd_off() {
+  local what=$1
+  if [[ -z $what ]]; then
+    what=$(gum choose --header "⏻ ¿Qué apagar? (se conserva todo, solo se detiene)" \
+      "Todo (k3d + Floci)" "Solo k3d" "Solo Floci" "Todo + Docker (libera la memoria de WSL)" "Cancelar") || return 0
+    case $what in Todo\ \(*) what=all ;; Solo\ k3d) what=k3d ;; Solo\ Floci) what=floci ;; Todo\ +*) what=docker ;; *) return 0 ;; esac
+  fi
+  [[ $what == (all|floci|k3d|docker) ]] || { err "Uso: dev off [all|floci|k3d|docker]"; return 1 }
+  docker_running || { ok "Docker ya está apagado (y con él todo)"; return 0 }
+  title "Apagando ${${what/all/todo}/docker/todo + Docker}"
+  [[ $what == (all|k3d|docker) ]]   && stop_k3d
+  [[ $what == (all|floci|docker) ]] && stop_floci
+  [[ $what == docker ]] && stop_docker
+  return 0
+}
+
+# Interruptor del menú: según lo que esté encendido ofrece lo que tiene sentido
+cmd_power() {
+  local d=0 f=0 k=0
+  docker_running && { d=1; floci_running && f=1; cluster_running && k=1 }
+  print -r -- "  Docker $( ((d)) && print 🟢 || print 🔴)   Floci $( ((f)) && print 🟢 || print 🔴)   k3d $( ((k)) && print 🟢 || print 🔴)"
+  local -a opts=()
+  (( f && k )) || opts+="⏻ Encender todo"
+  (( f )) || opts+="⏻ Encender solo Floci"
+  (( k )) || opts+="⏻ Encender solo k3d"
+  (( f || k )) && opts+="⏼ Apagar…"
+  (( d && !f && !k )) && opts+="⏼ Apagar Docker (libera la memoria de WSL)"
+  local c; c=$(gum choose --header "Encender / apagar" $opts "Cancelar") || return 0
+  case $c in
+    *"Encender todo")  cmd_on all ;;
+    *"solo Floci")     cmd_on floci ;;
+    *"solo k3d")       cmd_on k3d ;;
+    *"Apagar…")        cmd_off ;;
+    *"Apagar Docker"*) title "Apagando Docker"; stop_docker ;;
+  esac
+}
+
+cmd_up()    { cmd_on "$@" }        # nombres anteriores
+cmd_pause() { cmd_off all }
+
+# ---------------------------------------------------------------- acciones
 deploy() {   # $1 = build | nobuild
   need_project || return 1
-  cluster_running || { err "El clúster no está corriendo. Usa 'Levantar ambiente' primero."; return 1 }
+  need_cluster || return 1
   title "Desplegando $APP"
+  local t0=$EPOCHSECONDS
 
   if [[ $1 == build ]]; then
     if [[ -x $PROJECT/gradlew && -n $GRADLE_TASK && $GRADLE_TASK != false ]]; then
       step "Compilando con Gradle ($GRADLE_TASK)" $PROJECT/gradlew -p $PROJECT ${=GRADLE_TASK} || return 1
     fi
-    (( $#BUILD_ARGS )) && dim "  build args: ${BUILD_ARGS#--build-arg=}"
+    (( $#BUILD_ARGS )) && dim "  build args: ${(j:  ·  :)${BUILD_ARGS#--build-arg=}}"
     step "Construyendo imagen $IMAGE" docker build -f $PROJECT/$DOCKERFILE $BUILD_ARGS -t $IMAGE $PROJECT || return 1
     step "Importando imagen a k3d" k3d image import $IMAGE -c $CLUSTER || return 1
   fi
@@ -298,44 +438,76 @@ deploy() {   # $1 = build | nobuild
   NOW=$(strftime %Y-%m-%dT%H:%M:%S $EPOCHSECONDS) \
     yq -i '(select(.kind == "Deployment") | .spec.template.metadata.annotations."dev-scripts/restarted-at") = strenv(NOW)' \
     $out/*.yaml(N)
-  if yq 'select(.kind == "Deployment") | .spec.template.spec.containers[].imagePullPolicy' $out/*.yaml(N) \
-       | grep -q Always; then
+  if [[ $(yq 'select(.kind == "Deployment") | .spec.template.spec.containers[].imagePullPolicy' $out/*.yaml(N)) == *Always* ]]; then
     warn "imagePullPolicy: Always en local → k3d intentará bajar $IMAGE de un registry. Usa IfNotPresent."
   fi
+  # El nombre real del Deployment sale de los manifiestos (no depende de la convención <app>-deploy)
+  local dname=$(yq 'select(.kind == "Deployment") | .metadata.name' $out/*.yaml(N) | grep -v -- '---' | head -1)
+  [[ -n $dname ]] && DEPLOY=deployment/$dname
 
   ensure_namespace $NS || return 1
-  step "Aplicando manifiestos" kubectl apply -f $out || return 1
+  step "Aplicando manifiestos" $K apply -f $out || return 1
   grep -v unchanged $LOG | sed 's/^/  /'
 
-  if step "Esperando a que el pod quede listo" kubectl rollout status $DEPLOY -n $NS --timeout=300s; then
-    ok "$APP desplegado"
+  if step "Esperando a que el pod quede listo" $K rollout status $DEPLOY -n $NS --timeout=$ROLLOUT_TIMEOUT; then
+    ok "$APP desplegado en $(( EPOCHSECONDS - t0 ))s"
   else
-    kubectl get pods -n $NS -l app=$APP
-    gum confirm "¿Ver los logs del pod?" && kubectl logs -n $NS -l app=$APP --tail=80
+    diagnose
     return 1
   fi
 }
+
+# Por qué no arranca: estado de cada pod, motivo (CrashLoopBackOff, ImagePull, OOMKilled,
+# probes...), eventos recientes y logs del intento anterior si el contenedor se reinició.
+diagnose() {
+  title "Diagnóstico de $APP"
+  $K get pods -n $NS -l app=$APP -o wide
+  echo
+  local pod reason restarts
+  for pod in ${(f)"$($K get pods -n $NS -l app=$APP -o name 2>/dev/null)"}; do
+    reason=$($K get $pod -n $NS -o jsonpath='{range .status.containerStatuses[*]}{.state.waiting.reason}{.state.terminated.reason} {.lastState.terminated.reason} (exit {.lastState.terminated.exitCode}){end}')
+    reason=${${reason// \(exit \)/}%% }
+    restarts=$($K get $pod -n $NS -o jsonpath='{.status.containerStatuses[0].restartCount}')
+    print -r -- "  ${pod#pod/}: ${reason:-sin motivo reportado} · reinicios: ${restarts:-0}"
+    case $reason in
+      *ErrImage*|*ImagePull*) dim "    → imagen no encontrada en k3d: ¿corriste 'deploy' (no 'apply')? ¿coincide $IMAGE?" ;;
+      *OOMKilled*)            dim "    → sin memoria: sube resources.limits.memory o baja -Xmx" ;;
+      *CreateContainerConfig*) dim "    → falta un ConfigMap/Secret referenciado (envFrom, volumes)" ;;
+    esac
+  done
+  echo
+  gum style --bold "Eventos"
+  $K get events -n $NS --sort-by=.lastTimestamp --field-selector type=Warning 2>/dev/null | tail -n 8 | sed 's/^/  /'
+  echo
+  if (( ${restarts:-0} > 0 )) && gum confirm "¿Ver logs del intento anterior (el que falló)?"; then
+    $K logs -n $NS ${pod} --previous --tail=120
+  elif gum confirm "¿Ver los logs del pod?"; then
+    $K logs -n $NS -l app=$APP --all-containers --prefix --tail=80
+  fi
+}
+cmd_diagnose() { need_project && need_cluster && diagnose }
 cmd_deploy() { deploy build }
 cmd_apply()  { deploy nobuild }
 
 cmd_project() { pick_project && ok "Proyecto: $APP ($PROJECT)" }
 
 cmd_status() {
-  need_project || return 1
+  need_project && need_cluster || return 1
   title "Estado de $APP"
-  kubectl get deploy,pods,svc,hpa -n $NS -l app=$APP 2>/dev/null || kubectl get all -n $NS
+  $K get deploy,pods,svc,hpa -n $NS -l app=$APP 2>/dev/null || $K get all -n $NS
   echo
-  kubectl get events -n $NS --sort-by=.lastTimestamp 2>/dev/null | tail -n 8
+  $K get events -n $NS --sort-by=.lastTimestamp 2>/dev/null | tail -n 8
 }
 
 cmd_overview() {
+  need_cluster || return 1
   title "Proyectos en $PROJECTS_DIR"
   local name app ns ready; local -a v
   printf '  %-28s %-14s %s\n' PROYECTO NAMESPACE LISTOS
   for name in $(list_projects); do
-    v=("${(@f)$(yq '.local | (.appName // "", .namespace // "local")' $PROJECTS_DIR/$name/k8s/vars.yaml)}")
+    v=("${(@f)$(yq '.local | (.appName // "", .namespace // "local", .deploymentName // .appName + "-deploy")' $PROJECTS_DIR/$name/k8s/vars.yaml)}")
     app=$v[1] ns=$v[2]
-    ready=$(kubectl get deploy $app-deploy -n $ns \
+    ready=$($K get deploy $v[3] -n $ns \
       -o jsonpath='{.status.readyReplicas}/{.spec.replicas}' 2>/dev/null) || ready="—"
     [[ $ready == /* ]] && ready="0$ready"
     printf '  %-28s %-14s %s\n' "$name$([[ $app == $APP ]] && print ' ◀')" $ns $ready
@@ -343,38 +515,17 @@ cmd_overview() {
 }
 
 cmd_logs() {
-  need_project || return 1
+  need_project && need_cluster || return 1
   title "Logs de $APP (Ctrl+C para salir)"
-  kubectl logs -f -n $NS -l app=$APP --all-containers --prefix --max-log-requests 10 --tail=100
+  $K logs -f -n $NS -l app=$APP --all-containers --prefix --max-log-requests 10 --tail=100
 }
 
 cmd_forward() {
-  need_project || return 1
+  need_project && need_cluster || return 1
   local lp
   lp=$(gum input --header "Puerto local" --value $PORT) || return
   ok "http://localhost:$lp → $APP:$PORT   (Ctrl+C para cortar)"
-  kubectl port-forward -n $NS $DEPLOY $lp:$PORT
-}
-
-cmd_aws() {
-  title "Recursos en Floci"
-  local -a a=(aws --profile floci --output text)
-  _list() { gum style --bold $1; shift; "$@" 2>/dev/null | tr '\t' '\n' | sed '/^$/d; s/^/  /' }
-  _list "SQS"             $a sqs list-queues --query 'QueueUrls[]'
-  _list "SNS"             $a sns list-topics --query 'Topics[].TopicArn'
-  _list "DynamoDB"        $a dynamodb list-tables --query 'TableNames[]'
-  _list "S3"              $a s3api list-buckets --query 'Buckets[].Name'
-  _list "Secrets Manager" $a secretsmanager list-secrets --query 'SecretList[].Name'
-  _list "SSM"             $a ssm describe-parameters --query 'Parameters[].Name'
-  _list "Lambda"          $a lambda list-functions --query 'Functions[].FunctionName'
-  _list "API Gateway ($API_ID)" $a apigateway get-resources --rest-api-id $API_ID --query 'items[?resourceMethods].path'
-  dim "Vista web: http://localhost:4500"
-}
-
-cmd_pause() {
-  title "Pausando ambiente (se conserva todo)"
-  step "Deteniendo clúster" k3d cluster stop $CLUSTER
-  step "Deteniendo Floci" docker compose -f $(compose_file) stop
+  $K port-forward -n $NS $DEPLOY $lp:$PORT
 }
 
 cmd_destroy() {
@@ -392,39 +543,589 @@ cmd_destroy() {
 
 cmd_log() { [[ -s $LOG ]] && gum pager <$LOG || warn "Aún no hay log" }
 
-# ---------------------------------------------------------------- API Gateway (antes apigw.sh)
-# Reconstruye el API completo con el mismo ID en cada ejecución, así la URL no cambia:
+# ================================================================ recursos en Floci (stack/aws/*.yaml)
+# Un archivo por proyecto declara lo que necesita. Aplicarlo crea solo lo que falta.
+# Solo para Floci: awsx() siempre usa el endpoint de Floci con credenciales de prueba.
+# Los recursos de las cuentas reales se despliegan con CloudFormation (su propio repo/pipeline).
+#
+#   sqs:
+#     - name: pagos-eventos
+#       dlq: {maxReceiveCount: 3}      # o dlq: true → crea pagos-eventos-dlq y la enlaza
+#       visibilityTimeout: 30
+#     - pagos-cmd.fifo                  # forma corta: solo el nombre (.fifo → cola FIFO)
+#   sns:
+#     - name: pagos-topic
+#       subscriptions: [{protocol: sqs, endpoint: pagos-eventos, raw: true}]
+#   dynamodb:
+#     - name: pagos
+#       key: {pk: S, sk: S}             # la 1ª es HASH, la 2ª RANGE · S | N | B
+#       gsi: [{name: por-estado, key: {estado: S}}]
+#       items: [{pk: "1", sk: "a", monto: 10}]   # semilla, solo al crear la tabla
+#   s3: [pagos-docs]
+#   secrets: [{name: pagos/db, value: {user: app, pass: ${DB_PASS}}}]  # ${VAR} del entorno
+#   ssm:     [{name: /pagos/url, value: http://x, type: String}]
+
+FLOCI_LABEL="Floci ($FLOCI)"
+AWS_TYPES=(sqs sns dynamodb s3 secrets ssm)
+typeset -A AWS_TYPE_LABEL=(sqs "SQS" sns "SNS" dynamodb "DynamoDB" s3 "S3" secrets "Secrets Manager" ssm "SSM Parameter Store")
+NORM='((select(tag == "!!str") | {"name": .}) // .)'
+
+awsx()  { $AWSL "$@" }
+awsjx() { $AWSL --output json "$@" }
+
+need_floci() {
+  floci_up && return 0
+  err "Floci no responde en $FLOCI. Usa ⏻ Encender (dev on floci)."; return 1
+}
+
+# Reemplaza ${VAR} por su valor del entorno (resultado en REPLY). Falla si VAR no existe.
+expand_env() {
+  local s=$1 out="" name
+  while [[ $s =~ '\$\{([A-Za-z_][A-Za-z0-9_]*)\}' ]]; do
+    name=$match[1]
+    (( ${+parameters[$name]} )) || { err "La variable de entorno $name no está definida"; return 1 }
+    out+=${s[1,MBEGIN-1]}${(P)name}
+    s=${s[MEND+1,-1]}
+  done
+  REPLY=$out$s
+}
+
+nonone() { tr '\t' '\n' | sed '/^None$/d; /^null$/d; /^$/d' }
+jv() { yq -p=json -o=yaml "$1" <<<"$J" }     # campo del recurso en $J (JSON)
+
+res() {  # estado tipo nombre [detalle]
+  case $1 in
+    new)  gum style --foreground 42  "  + ${(r:9:)2} $3${4:+   $4}" ;;
+    same) gum style --foreground 245 "  = ${(r:9:)2} $3${4:+   $4}" ;;
+    del)  gum style --foreground 214 "  - ${(r:9:)2} $3" ;;
+    fail) gum style --foreground 196 "  ✘ ${(r:9:)2} $3: ${4##*$'\n'}" ;;
+  esac
+}
+
+aws_files() { print -rl -- $AWS_DIR/*.yaml(N) }
+
+pick_aws_files() {  # multi-selección → rutas (preselecciona el del proyecto actual)
+  local -a f=(${(f)"$(aws_files)"})
+  (( $#f )) || { err "No hay archivos en ${AWS_DIR/#$HOME/~} (crea uno con 'Crear recurso' → Guardar)"; return 1 }
+  local sel
+  sel=$(gum choose --no-limit --header "📄 Archivos de stack/aws (espacio marca)" \
+        ${APP:+--selected=$APP} ${f:t:r}) || return 1
+  [[ -n $sel ]] || return 1
+  print -rl -- $AWS_DIR/${^${(f)sel}}.yaml
+}
+
+# ---- nombres e identificadores
+queue_url() { awsx sqs get-queue-url --queue-name $1 --query QueueUrl 2>/dev/null }
+queue_arn() { awsx sqs get-queue-attributes --queue-url $(queue_url $1) --attribute-names QueueArn --query Attributes.QueueArn }
+topic_arn() { awsx sns list-topics --query 'Topics[].TopicArn' 2>/dev/null | nonone | grep -E ":$1\$" | head -1 }
+dlq_name()  { [[ $1 == *.fifo ]] && print -r -- ${1%.fifo}-dlq.fifo || print -r -- $1-dlq }
+
+# JSON {"k":"v",...} desde un array asociativo (valores siempre string, como pide SQS)
+assoc_json() {
+  local -A a=("${(@Pkv)1}"); local k v out=""
+  for k v in ${(kv)a}; do v=${v//\\/\\\\}; v=${v//\"/\\\"}; out+="${out:+,}\"$k\":\"$v\""; done
+  print -r -- "{$out}"
+}
+
+# ---- aplicar un recurso (J = JSON del recurso normalizado)
+apply_sqs() {
+  local J=$1 name dlqk dlqv mrc vt dlq="" out
+  name=$(jv .name) dlqk=$(jv '.dlq | tag') dlqv=$(jv '.dlq') mrc=$(jv '.dlq.maxReceiveCount // 3') vt=$(jv '.visibilityTimeout // ""')
+  [[ -n $name && $name != null ]] || { res fail sqs "?" "falta name"; return 1 }
+  if [[ $dlqk == '!!map' || $dlqv == true ]]; then
+    dlq=$(dlq_name $name)
+    ensure_queue $dlq || return 1
+  fi
+  ensure_queue $name "$vt" "$dlq" "$mrc"
+}
+
+ensure_queue() {  # nombre [visibilityTimeout] [dlq] [maxReceiveCount]
+  local name=$1 vt=$2 dlq=$3 mrc=$4 url out
+  local -A at=()
+  [[ -n $vt ]] && at[VisibilityTimeout]=$vt
+  [[ -n $dlq ]] && at[RedrivePolicy]="{\"deadLetterTargetArn\":\"$(queue_arn $dlq)\",\"maxReceiveCount\":\"$mrc\"}"
+  if url=$(queue_url $name); then
+    (( $#at )) && awsx sqs set-queue-attributes --queue-url $url --attributes "$(assoc_json at)" >/dev/null 2>&1
+    res same sqs $name "${dlq:+→ $dlq}"
+    return 0
+  fi
+  [[ $name == *.fifo ]] && at[FifoQueue]=true
+  local -a attrarg=()
+  (( $#at )) && attrarg=(--attributes "$(assoc_json at)")
+  if out=$(awsx sqs create-queue --queue-name $name $attrarg 2>&1); then
+    res new sqs $name "${dlq:+→ DLQ $dlq (maxReceiveCount $mrc)}"
+  else
+    res fail sqs $name "$out"; return 1
+  fi
+}
+
+apply_sns() {
+  local J=$1 name arn out i n p ep raw had
+  name=$(jv .name)
+  had=$(topic_arn $name)
+  arn=$(awsx sns create-topic --name $name --query TopicArn 2>&1) || { res fail sns $name "$arn"; return 1 }
+  [[ -n $had ]] && res same sns $name || res new sns $name
+  n=$(jv '(.subscriptions // []) | length')
+  local -a existing=(${(f)"$(awsx sns list-subscriptions-by-topic --topic-arn $arn --query 'Subscriptions[].Endpoint' 2>/dev/null | nonone)"})
+  for (( i=0; i<n; i++ )); do
+    p=$(jv ".subscriptions[$i].protocol // \"sqs\"") ep=$(jv ".subscriptions[$i].endpoint") raw=$(jv ".subscriptions[$i].raw // false")
+    [[ $p == sqs && $ep != arn:* ]] && { ep=$(queue_arn $ep) || { res fail sns "$name" "la cola $(jv ".subscriptions[$i].endpoint") no existe"; continue } }
+    if (( ${existing[(Ie)$ep]} )); then res same "  └ sub" "$p → ${ep##*:}"; continue; fi
+    if out=$(awsx sns subscribe --topic-arn $arn --protocol $p --notification-endpoint $ep \
+             ${${(M)raw:#true}:+--attributes} ${${(M)raw:#true}:+RawMessageDelivery=true} 2>&1); then
+      res new "  └ sub" "$p → ${ep##*:}${${(M)raw:#true}:+ (raw)}"
+    else res fail "  └ sub" "${ep##*:}" "$out"
+    fi
+  done
+}
+
+apply_dynamodb() {
+  local J=$1 name input out n i item
+  name=$(jv .name)
+  if awsx dynamodb describe-table --table-name $name >/dev/null 2>&1; then res same dynamodb $name; return 0; fi
+  input=$(yq -p=json -o=json -I=0 '{
+      "TableName": .name, "BillingMode": "PAY_PER_REQUEST",
+      "KeySchema": (.key | to_entries | to_entries | map({"AttributeName": .value.key, "KeyType": (if .key == 0 then "HASH" else "RANGE" end)})),
+      "AttributeDefinitions": (([.key] + ((.gsi // []) | map(.key))) | map(to_entries) | flatten | unique_by(.key) | map({"AttributeName": .key, "AttributeType": .value})),
+      "GlobalSecondaryIndexes": ((.gsi // []) | map({"IndexName": .name,
+          "KeySchema": (.key | to_entries | to_entries | map({"AttributeName": .value.key, "KeyType": (if .key == 0 then "HASH" else "RANGE" end)})),
+          "Projection": {"ProjectionType": "ALL"}}))
+    } | with(select(.GlobalSecondaryIndexes | length == 0); del(.GlobalSecondaryIndexes))' <<<"$J" 2>&1) \
+    || { res fail dynamodb $name "definición inválida (¿falta key?): $input"; return 1 }
+  out=$(awsx dynamodb create-table --cli-input-json "$input" 2>&1) || { res fail dynamodb $name "$out"; return 1 }
+  awsx dynamodb wait table-exists --table-name $name 2>/dev/null
+  n=$(jv '(.items // []) | length')
+  for (( i=0; i<n; i++ )); do   # semilla: valores simples → tipos de DynamoDB
+    item=$(yq -p=json -o=json -I=0 ".items[$i] | with_entries(.value |= (
+        (select(tag == \"!!str\") | {\"S\": .}) // (select(tag == \"!!int\" or tag == \"!!float\") | {\"N\": to_string})
+        // (select(tag == \"!!bool\") | {\"BOOL\": .}) // {\"S\": (. | @json)}))" <<<"$J")
+    awsx dynamodb put-item --table-name $name --item "$item" >/dev/null 2>&1 || res fail dynamodb "$name" "ítem $((i+1)) no se pudo insertar"
+  done
+  res new dynamodb $name "key: $(jv '.key | to_entries | map(.key + ":" + .value) | join(", ")')${${(M)n:#<1->}:+ · $n ítems}"
+}
+
+apply_s3() {
+  local J=$1 name out
+  name=$(jv .name)
+  if awsx s3api head-bucket --bucket $name >/dev/null 2>&1; then res same s3 $name; return 0; fi
+  local -a loc=()
+  [[ $REGION != us-east-1 ]] && loc=(--create-bucket-configuration LocationConstraint=$REGION)
+  out=$(awsx s3api create-bucket --bucket $name $loc 2>&1) && res new s3 $name || { res fail s3 $name "$out"; return 1 }
+}
+
+apply_secrets() {
+  local J=$1 name val out input
+  name=$(jv .name)
+  if awsx secretsmanager describe-secret --secret-id $name >/dev/null 2>&1; then res same secret $name; return 0; fi
+  val=$(yq -p=json -o=yaml '(.value | select(tag == "!!map" or tag == "!!seq") | @json) // (.value // "" | to_string)' <<<"$J")
+  expand_env "$val" || { res fail secret $name "variable de entorno faltante"; return 1 }
+  input=$(N=$name V=$REPLY yq -n -o=json -I=0 '.Name = strenv(N) | .SecretString = strenv(V)')
+  out=$(awsx secretsmanager create-secret --cli-input-json "$input" 2>&1) && res new secret $name || { res fail secret $name "$out"; return 1 }
+}
+
+apply_ssm() {
+  local J=$1 name out input
+  name=$(jv .name)
+  if awsx ssm get-parameter --name $name >/dev/null 2>&1; then res same ssm $name; return 0; fi
+  expand_env "$(jv '.value // "" | to_string')" || { res fail ssm $name "variable de entorno faltante"; return 1 }
+  input=$(N=$name V=$REPLY T=$(jv '.type // "String"') yq -n -o=json -I=0 '.Name = strenv(N) | .Value = strenv(V) | .Type = strenv(T)')
+  out=$(awsx ssm put-parameter --cli-input-json "$input" 2>&1) && res new ssm $name "($(jv '.type // "String"'))" || { res fail ssm $name "$out"; return 1 }
+}
+
+# Aplica uno o varios archivos: crea lo que falta, deja lo que existe
+aws_apply() {
+  need_floci || return 1
+  local f t i n J fails=0
+  local -a unknown
+  for f in "$@"; do
+    [[ -f $f ]] || f=$AWS_DIR/${f%.yaml}.yaml
+    [[ -f $f ]] || { err "No existe $f"; fails=1; continue }
+    title "📄 ${f:t}"
+    yq '.' $f >/dev/null 2>&1 || { err "${f:t}: YAML inválido"; fails=1; continue }
+    unknown=(${(f)"$(yq 'keys | .[]' $f 2>/dev/null)"}); unknown=(${unknown:|AWS_TYPES})
+    (( $#unknown )) && warn "Claves no reconocidas en ${f:t}: ${(j:, :)unknown} (válidas: ${(j:, :)AWS_TYPES})"
+    for t in $AWS_TYPES; do
+      n=$(yq "(.$t // []) | length" $f)
+      for (( i=0; i<n; i++ )); do
+        J=$(yq -o=json -I=0 "(.$t // [])[$i] | $NORM" $f)
+        apply_$t "$J" || fails=1
+      done
+    done
+  done
+  dim "  + creado   = ya existía (no se modifica)"
+  return $fails
+}
+
+# ---- inventario: líneas "tipo<TAB>nombre<TAB>id" (id = URL de cola / ARN de tópico / nombre)
+aws_inventory() {
+  local x
+  for x in ${(f)"$(awsx sqs list-queues --query 'QueueUrls[]' 2>/dev/null | nonone)"}; do print -r -- "sqs	${x##*/}	$x"; done
+  for x in ${(f)"$(awsx sns list-topics --query 'Topics[].TopicArn' 2>/dev/null | nonone)"}; do print -r -- "sns	${x##*:}	$x"; done
+  for x in ${(f)"$(awsx dynamodb list-tables --query 'TableNames[]' 2>/dev/null | nonone)"}; do print -r -- "dynamodb	$x	$x"; done
+  for x in ${(f)"$(awsx s3api list-buckets --query 'Buckets[].Name' 2>/dev/null | nonone)"}; do print -r -- "s3	$x	$x"; done
+  for x in ${(f)"$(awsx secretsmanager list-secrets --query 'SecretList[].Name' 2>/dev/null | nonone)"}; do print -r -- "secrets	$x	$x"; done
+  for x in ${(f)"$(awsx ssm describe-parameters --query 'Parameters[].Name' 2>/dev/null | nonone)"}; do print -r -- "ssm	$x	$x"; done
+}
+floci_empty() { floci_up && [[ -z $(aws_inventory) ]] }
+
+# DECL[tipo:nombre] = archivo que lo declara (incluye las DLQ implícitas)
+typeset -gA DECL
+declared_index() {
+  DECL=()
+  local f t line name dlq
+  for f in ${(f)"$(aws_files)"}; do
+    for t in $AWS_TYPES; do
+      for line in ${(f)"$(yq "(.$t // [])[] | $NORM | .name + \"	\" + ((.dlq // false) | tag) + ((.dlq // false) | to_string)" $f 2>/dev/null)"}; do
+        name=${line%%	*} dlq=${line#*	}
+        DECL[$t:$name]=${f:t:r}
+        [[ $t == sqs && ( $dlq == '!!map'* || $dlq == *true ) ]] && DECL[sqs:$(dlq_name $name)]=${f:t:r}
+      done
+    done
+  done
+}
+
+# ---- ver
+cmd_aws_ls() {
+  need_floci || return 1
+  declared_index
+  local -a inv=(${(f)"$(aws_inventory)"})
+  local -A have
+  local t name id l a vis fly rp dl cnt
+  for l in $inv; do have[${l%%	*}:${${l#*	}%%	*}]=1; done
+  title "☁  Recursos AWS en $FLOCI_LABEL"
+  (( $#inv )) || dim "  (no hay recursos)"
+  for t in $AWS_TYPES; do
+    local -a rows=(${(M)inv:#$t	*})
+    (( $#rows )) || continue
+    echo; gum style --bold "${AWS_TYPE_LABEL[$t]} ($#rows)"
+    for l in $rows; do
+      name=${${l#*	}%%	*} id=${l##*	}
+      local src="📄 ${DECL[$t:$name]:-— sin archivo}"
+      case $t in
+        sqs)
+          a=(${(s:	:)"$(awsx sqs get-queue-attributes --queue-url $id --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible RedrivePolicy \
+                --query 'Attributes.[ApproximateNumberOfMessages,ApproximateNumberOfMessagesNotVisible,RedrivePolicy]' 2>/dev/null)"})
+          vis=${a[1]:-?} fly=${a[2]:-?} rp=${a[3]} dl=""
+          [[ $rp =~ 'deadLetterTargetArn"[^"]*"[^"]*:([^:"]+)"' ]] && dl="→ DLQ $match[1]"
+          printf '  %-38s %5s msgs  %4s en vuelo  %-28s %s\n' $name $vis $fly "$dl" "$src" ;;
+        sns)
+          cnt=$(awsx sns list-subscriptions-by-topic --topic-arn $id --query 'length(Subscriptions)' 2>/dev/null)
+          printf '  %-38s %5s suscripciones                         %s\n' $name ${cnt:-0} "$src" ;;
+        dynamodb)
+          cnt=$(awsx dynamodb scan --table-name $name --select COUNT --query Count 2>/dev/null)
+          printf '  %-38s %5s ítems                                 %s\n' $name ${cnt:-?} "$src" ;;
+        s3)
+          cnt=$(awsx s3api list-objects-v2 --bucket $name --query 'KeyCount' 2>/dev/null)
+          [[ $cnt == (None|null) ]] && cnt=0
+          printf '  %-38s %5s objetos                               %s\n' $name ${cnt:-0} "$src" ;;
+        *)
+          printf '  %-38s %-44s %s\n' $name "" "$src" ;;
+      esac
+    done
+  done
+  # declarados en stack/aws pero que no existen
+  local -a missing=()
+  for l in ${(k)DECL}; do (( ${+have[$l]} )) || missing+="${l%%:*} ${l#*:} (📄 ${DECL[$l]})"; done
+  if (( $#missing )); then
+    echo; warn "Declarados en stack/aws pero no creados:"
+    print -rl -- "    "${^${(o)missing}}
+    dim "  Créalos con: dev aws apply"
+  fi
+  echo; dim "Vista web: http://localhost:4500"
+}
+
+# ---- crear desde archivos
+cmd_aws_apply() {
+  local -a files=("$@")
+  if (( ! $#files )); then
+    [[ -t 0 ]] && files=(${(f)"$(pick_aws_files)"}) || files=(${(f)"$(aws_files)"})
+  fi
+  (( $#files )) || return 0
+  aws_apply $files
+}
+
+# ---- crear interactivo: arma el mismo YAML que un archivo, lo aplica y ofrece guardarlo
+cmd_aws_new() {
+  need_floci || return 1
+  local t c name J
+  c=$(gum choose --header "➕ ¿Qué recurso?" "SQS · cola" "SNS · tópico" "DynamoDB · tabla" "S3 · bucket" \
+      "Secrets Manager · secreto" "SSM · parámetro") || return 0
+  case $c in SQS*) t=sqs ;; SNS*) t=sns ;; Dynamo*) t=dynamodb ;; S3*) t=s3 ;; Secrets*) t=secrets ;; SSM*) t=ssm ;; esac
+  name=$(gum input --header "Nombre" --placeholder "${APP:-mi-app}-…") || return 0
+  [[ -n $name ]] || return 0
+  J=$(N=$name yq -n -o=json -I=0 '.name = strenv(N)')
+  case $t in
+    sqs)
+      gum confirm --default=false "¿Cola FIFO?" && [[ $name != *.fifo ]] && { name+=.fifo; J=$(N=$name yq -n -o=json -I=0 '.name = strenv(N)') }
+      if gum confirm "¿Con DLQ (cola de mensajes fallidos)?"; then
+        local m; m=$(gum input --header "maxReceiveCount (intentos antes de ir a la DLQ)" --value 3) || return 0
+        J=$(M=$m yq -p=json -o=json -I=0 '.dlq.maxReceiveCount = (strenv(M) | to_number)' <<<"$J")
+      fi
+      local v; v=$(gum input --header "visibilityTimeout (segundos)" --value 30) || return 0
+      [[ $v != 30 && -n $v ]] && J=$(V=$v yq -p=json -o=json -I=0 '.visibilityTimeout = (strenv(V) | to_number)' <<<"$J") ;;
+    sns)
+      local -a qs=(${(f)"$(awsx sqs list-queues --query 'QueueUrls[]' 2>/dev/null | nonone)"}) sel
+      if (( $#qs )); then
+        sel=(${(f)"$(gum choose --no-limit --header "Suscribir colas (opcional, espacio marca)" ${qs##*/})"})
+        local q; for q in $sel; do
+          J=$(Q=$q yq -p=json -o=json -I=0 '.subscriptions += [{"protocol": "sqs", "endpoint": strenv(Q)}]' <<<"$J")
+        done
+      fi ;;
+    dynamodb)
+      local pk pt sk st
+      pk=$(gum input --header "Partition key (nombre)" --value pk) || return 0
+      pt=$(gum choose --header "Tipo de $pk" S N B) || return 0
+      J=$(K=$pk T=$pt yq -p=json -o=json -I=0 '.key[strenv(K)] = strenv(T)' <<<"$J")
+      sk=$(gum input --header "Sort key (vacío = sin sort key)" --placeholder sk) || return 0
+      if [[ -n $sk ]]; then
+        st=$(gum choose --header "Tipo de $sk" S N B) || return 0
+        J=$(K=$sk T=$st yq -p=json -o=json -I=0 '.key[strenv(K)] = strenv(T)' <<<"$J")
+      fi ;;
+    secrets)
+      local val; val=$(gum write --header "Valor (texto o JSON · \${VAR} se toma del entorno · Ctrl+D termina)" --height 6) || return 0
+      J=$(V=$val yq -p=json -o=json -I=0 '.value = strenv(V)' <<<"$J") ;;
+    ssm)
+      local val ty; val=$(gum input --header "Valor" --width 80) || return 0
+      ty=$(gum choose --header "Tipo" String SecureString StringList) || return 0
+      J=$(V=$val T=$ty yq -p=json -o=json -I=0 '.value = strenv(V) | .type = strenv(T)' <<<"$J") ;;
+  esac
+
+  echo; gum style --foreground 245 "$t:" "$(yq -p=json -o=yaml <<<"[$J]" | sed 's/^/  /')"
+  gum confirm "¿Crear?" || return 0
+  apply_$t "$J" || return 1
+
+  # Guardar en un archivo para que sea reproducible
+  local -a files=(${(f)"$(aws_files)"}) opts; local dest def=${APP:-}
+  opts=(${files:t:r})
+  [[ -n $def ]] && (( ! ${opts[(Ie)$def]} )) && opts+="Nuevo: $def.yaml"
+  opts+=("Nuevo archivo…" "No guardar")
+  dest=$(gum choose --header "💾 ¿Guardarlo en stack/aws/? (así se recrea desde el archivo)" \
+         ${def:+--selected=${${(M)opts:#$def}:-Nuevo: $def.yaml}} $opts) || return 0
+  case $dest in
+    "No guardar") dim "  Solo existe en Floci: no se recreará desde los archivos."; return 0 ;;
+    "Nuevo archivo…") dest=$(gum input --header "Nombre del archivo (sin .yaml)" --value "$def") || return 0 ;;
+    Nuevo:*) dest=${${dest#Nuevo: }%.yaml} ;;
+  esac
+  [[ -n $dest ]] || return 0
+  local f=$AWS_DIR/$dest.yaml
+  mkdir -p $AWS_DIR; [[ -f $f ]] || print "# Recursos AWS de $dest (dev aws apply)" >$f
+  T=$t J=$J yq -i '.[strenv(T)] = ((.[strenv(T)] // []) + [strenv(J) | @jsond]) | .[strenv(T)][-1] |= (... style="")' $f \
+    && ok "Guardado en ${f/#$HOME/~}"
+}
+
+# ---- eliminar
+delete_res() {  # tipo nombre id
+  local t=$1 name=$2 id=$3 out
+  case $t in
+    sqs)      out=$(awsx sqs delete-queue --queue-url $id 2>&1) ;;
+    sns)      out=$(awsx sns delete-topic --topic-arn $id 2>&1) ;;
+    dynamodb) out=$(awsx dynamodb delete-table --table-name $name 2>&1) ;;
+    s3)       out=$(awsx s3 rb s3://$name --force 2>&1) ;;
+    secrets)  out=$(awsx secretsmanager delete-secret --secret-id $name --force-delete-without-recovery 2>&1) ;;
+    ssm)      out=$(awsx ssm delete-parameter --name $name 2>&1) ;;
+  esac && res del $t $name || res fail $t $name "$out"
+}
+
+cmd_aws_rm() {
+  need_floci || return 1
+  local mode; mode=$(gum choose --header "🗑  ¿Qué eliminar? (los archivos de stack/aws no se tocan)" \
+      "Elegir recursos" "Todo lo declarado en un archivo" "Todo (vaciar Floci)" "Cancelar") || return 0
+  local -a inv=(${(f)"$(aws_inventory)"}) sel=() l
+  (( $#inv )) || { dim "No hay recursos."; return 0 }
+  case $mode in
+    Elegir*)
+      local -a shown=()
+      for l in $inv; do shown+="${(r:9:)${l%%	*}} ${${l#*	}%%	*}"; done
+      sel=(${(f)"$(print -rl -- $shown | gum filter --no-limit --header "Marca con Tab, Enter confirma" --placeholder "buscar…")"})
+      (( $#sel )) || return 0
+      local -a pick=() w
+      for l in $sel; do w=(${=l}); pick+=(${(M)inv:#$w[1]	$w[2]	*}); done
+      sel=($pick) ;;
+    Todo\ lo*)
+      local -a files=(${(f)"$(pick_aws_files)"}) ; (( $#files )) || return 0
+      declared_index
+      for l in $inv; do
+        local key=${l%%	*}:${${l#*	}%%	*}
+        (( ${+DECL[$key]} )) && (( ${files[(Ie)$AWS_DIR/${DECL[$key]}.yaml]} )) && sel+=$l
+      done ;;
+    Todo\ \(*) sel=($inv) ;;
+    *) return 0 ;;
+  esac
+  (( $#sel )) || { dim "Nada que eliminar."; return 0 }
+  gum style --foreground 214 "Se eliminará:"; for l in $sel; do print -r -- "  ${(r:9:)${l%%	*}} ${${l#*	}%%	*}"; done
+  gum confirm --default=false "¿Eliminar ${#sel} recurso(s)? No se puede deshacer." || return 0
+  # primero lo que depende de otros (tópicos antes que colas; colas normales antes que DLQ)
+  for l in ${(M)sel:#sns	*} ${(M)sel:#sqs	*} ${sel:#(sns|sqs)	*}; do
+    delete_res ${l%%	*} ${${l#*	}%%	*} ${l##*	}
+  done
+}
+
+# ---- probar: mensajes, ítems, valores
+pick_res() {  # tipo encabezado → imprime "nombre<TAB>id"
+  local -a rows=(${(M)${(f)"$(aws_inventory)"}:#$1	*})
+  (( $#rows )) || { err "No hay recursos ${AWS_TYPE_LABEL[$1]}"; return 1 }
+  local sel; sel=$(print -rl -- ${${rows#*	}%%	*} | gum filter --header "$2" --placeholder "buscar…") || return 1
+  print -r -- ${${(M)rows:#$1	$sel	*}#*	}
+}
+
+cmd_aws_test() {
+  need_floci || return 1
+  local c r name id
+  c=$(gum choose --header "🧪 Probar" \
+      "📨 Enviar mensaje a una cola" "👀 Ver mensajes de una cola" "📥 Consumir mensajes (los elimina)" \
+      "🧹 Purgar cola" "📢 Publicar en un tópico SNS" "🗃  Ver ítems de una tabla" \
+      "🔑 Ver valor de secreto / parámetro" "🪣 Ver objetos de un bucket") || return 0
+  case $c in
+    *Enviar*)
+      r=$(pick_res sqs "Cola") || return 0; name=${r%%	*} id=${r#*	}
+      local body; body=$(gum write --header "Mensaje para $name (Ctrl+D envía)" --height 8 --value '{}') || return 0
+      local -a fifo=()
+      if [[ $name == *.fifo ]]; then
+        local g; g=$(gum input --header "MessageGroupId" --value default) || return 0
+        fifo=(--message-group-id $g --message-deduplication-id ${EPOCHREALTIME/./})
+      fi
+      local mid; mid=$(awsx sqs send-message --queue-url $id --message-body "$body" $fifo --query MessageId 2>&1) \
+        && ok "Enviado a $name (MessageId $mid)" || err "No se pudo enviar: $mid" ;;
+    *Ver\ mensajes*|*Consumir*)
+      r=$(pick_res sqs "Cola") || return 0; name=${r%%	*} id=${r#*	}
+      local -a vt=(--visibility-timeout 0)
+      [[ $c == *Consumir* ]] && vt=()
+      [[ -z $vt ]] || dim "  Ojo: cada lectura cuenta para el maxReceiveCount de la DLQ."
+      local raw n i b
+      raw=$(awsjx sqs receive-message --queue-url $id --max-number-of-messages 10 --wait-time-seconds 1 $vt \
+            --attribute-names ApproximateReceiveCount 2>&1) || { err "$raw"; return 1 }
+      n=$(yq -p=json '(.Messages // []) | length' <<<"$raw")
+      (( n )) || { dim "  (la cola $name no tiene mensajes visibles)"; return 0 }
+      for (( i=0; i<n; i++ )); do
+        gum style --foreground 6 "── $((i+1))/$n · $(yq -p=json ".Messages[$i].MessageId" <<<"$raw") · lecturas: $(yq -p=json ".Messages[$i].Attributes.ApproximateReceiveCount" <<<"$raw")"
+        b=$(yq -p=json ".Messages[$i].Body" <<<"$raw")
+        yq -p=json -o=json <<<"$b" 2>/dev/null || print -r -- $b
+        [[ $c == *Consumir* ]] && awsx sqs delete-message --queue-url $id --receipt-handle "$(yq -p=json ".Messages[$i].ReceiptHandle" <<<"$raw")"
+      done
+      [[ $c == *Consumir* ]] && ok "$n mensaje(s) consumidos de $name" ;;
+    *Purgar*)
+      r=$(pick_res sqs "Cola a purgar") || return 0; name=${r%%	*} id=${r#*	}
+      gum confirm --default=false "¿Borrar todos los mensajes de $name?" && awsx sqs purge-queue --queue-url $id && ok "$name purgada" ;;
+    *Publicar*)
+      r=$(pick_res sns "Tópico") || return 0; name=${r%%	*} id=${r#*	}
+      local msg; msg=$(gum write --header "Mensaje para $name (Ctrl+D publica)" --height 8 --value '{}') || return 0
+      local mid; mid=$(awsx sns publish --topic-arn $id --message "$msg" --query MessageId 2>&1) \
+        && ok "Publicado en $name (MessageId $mid)" || err "No se pudo publicar: $mid" ;;
+    *ítems*)
+      r=$(pick_res dynamodb "Tabla") || return 0; name=${r%%	*}
+      local out; out=$(awsjx dynamodb scan --table-name $name --max-items 50 2>&1) || { err "$out"; return 1 }
+      { gum style --bold "$name · $(yq -p=json '.Count' <<<"$out") ítems (máx. 50)"
+        yq -p=json -o=yaml '.Items[] | [with_entries(.value |= (to_entries | .[0].value))]' <<<"$out"
+      } | gum pager ;;
+    *secreto*)
+      local -a both=(${(M)${(f)"$(aws_inventory)"}:#(secrets|ssm)	*})
+      (( $#both )) || { err "No hay secretos ni parámetros"; return 1 }
+      local sel; sel=$(print -rl -- ${both/	/ · } | sed 's/	.*//' | gum filter --header "Secreto o parámetro") || return 0
+      if [[ $sel == secrets* ]]; then awsx secretsmanager get-secret-value --secret-id ${sel#secrets · } --query SecretString
+      else awsx ssm get-parameter --name ${sel#ssm · } --with-decryption --query Parameter.Value; fi ;;
+    *objetos*)
+      r=$(pick_res s3 "Bucket") || return 0; name=${r%%	*}
+      awsx s3api list-objects-v2 --bucket $name --query 'Contents[].[Key,Size,LastModified]' | nonone_rows ;;
+  esac
+}
+nonone_rows() { sed '/^None$/d' | awk -F'\t' 'NF{printf "  %-50s %10s  %s\n",$1,$2,$3} END{if(NR==0)print "  (vacío)"}' }
+
+# dev aws [ls|apply [archivo…]|new|rm|test] — sin argumentos, submenú
+cmd_aws() {
+  local sub=$1; shift 2>/dev/null
+  case $sub in
+    ls)    cmd_aws_ls ;;
+    apply) cmd_aws_apply "$@" ;;
+    new)   cmd_aws_new ;;
+    rm)    cmd_aws_rm ;;
+    test)  cmd_aws_test ;;
+    "")    [[ -t 0 ]] || { cmd_aws_ls; return }
+           submenu "☁  Recursos AWS · $FLOCI_LABEL" \
+             "👀 Ver recursos|cmd_aws_ls" "📄 Crear desde archivos (stack/aws)|cmd_aws_apply" \
+             "➕ Crear recurso…|cmd_aws_new" "🧪 Probar (mensajes, ítems, valores)…|cmd_aws_test" \
+             "🗑  Eliminar recursos…|cmd_aws_rm" ;;
+    *) err "Uso: dev aws [ls|apply [archivo…]|new|rm|test]"; return 1 ;;
+  esac
+}
+
+# ================================================================ API Gateway (stack/apigw/*.yaml)
+# Un archivo por microservicio con sus rutas. Eliges qué archivos o rutas están activos;
+# dev lo recuerda y reconstruye el API con esa selección (mismo ID → la URL no cambia):
 #   http://localhost:4566/restapis/local/local/_user_request_/<ruta>
+#
+#   app: hola-mundo          # = label app del Deployment
+#   namespace: local         # opcional (local)
+#   localPort: 9001          # único por app: puerto del Service LoadBalancer en el nodo k3d
+#   containerPort: 8080      # opcional (8080)
+#   routes:
+#     - {method: GET, path: /hola}
+#     - {method: ANY, path: "/hola/{proxy+}", target: "/{proxy}"}   # con llaves: entre comillas
+
+ACTIVE=$CACHE/apigw-active          # rutas activas: "archivo<TAB>MÉTODO<TAB>ruta"
+API_ID_FILE=$CACHE/apigw-id         # ID real del API (Floci respeta 'local'; otros emuladores no)
+[[ -z $API_ID_SET && -s $API_ID_FILE ]] && API_ID=$(<$API_ID_FILE)
+
 awsf() {  # AWS CLI contra Floci; en DRY_RUN solo imprime y devuelve un ID falso
   if [[ $DRY_RUN == 1 ]]; then
     print -r -- "  aws $*" >&2; print "id${EPOCHREALTIME#*.}"
   else
-    aws --profile floci --output text "$@"
+    awsx "$@"
   fi
 }
 
-cmd_apigw() {
-  local -a files=($ROUTES_DIR/*.yaml(N))
-  (( $#files )) || { err "No hay archivos de rutas en $ROUTES_DIR"; return 1 }
-  local node=k3d-$CLUSTER-server-0   # alcanzable desde Floci por la red $NETWORK
+route_files() { print -rl -- $ROUTES_DIR/*.yaml(N) }
 
-  # validación
+# Archivos de rutas con YAML inválido (un error aquí no debe terminar borrando el API)
+check_route_files() {
+  local f bad=0 e
+  for f in ${(f)"$(route_files)"}; do
+    e=$(yq '.routes | length' $f 2>&1) || { err "${f:t}: YAML inválido → ${e##*: }"; bad=1; continue }
+    [[ $e == <1-> ]] || { err "${f:t}: no tiene 'routes'"; bad=1 }
+  done
+  (( bad )) && dim "  Tip: en mapas en línea, rutas con llaves van entre comillas: {method: GET, path: \"/x/{id}\"}"
+  return $bad
+}
+
+# Todas las rutas declaradas: "archivo<TAB>MÉTODO<TAB>ruta"
+all_routes() {
+  local f
+  for f in ${(f)"$(route_files)"}; do
+    yq '.routes[] | [(.method // "" | upcase), .path // ""] | @tsv' $f 2>/dev/null | sed "s|^|${f:t:r}	|"
+  done
+}
+active_routes() { [[ -f $ACTIVE ]] && grep -v '^$' $ACTIVE }
+fmt_route() { local f=${1%%	*} r=${1#*	}; print -r -- "${(r:16:)f} ${(r:7:)${r%%	*}} ${r#*	}" }   # para mostrar
+unfmt_route() { local -a w=(${=1}); print -r -- "$w[1]	$w[2]	$w[3]" }
+
+# ---- reconstruye el API con las rutas activas
+apigw_build() {
+  local -a sel=(${(f)"$(active_routes)"})
+  (( $#sel )) || { dim "No hay rutas activas: nada que publicar."; return 0 }
+  check_route_files || return 1
+  local node=k3d-$CLUSTER-server-0   # alcanzable desde Floci por la red $NETWORK
+  local -a files=(${(u)${sel%%	*}}) ; files=($ROUTES_DIR/${^files}.yaml)
+
+  # validación de los archivos involucrados
   local -A seen_port seen_route
   local f app port m p key
   for f in $files; do
+    [[ -f $f ]] || { err "No existe ${f:t} (¿lo renombraste?). Quita sus rutas de la selección."; return 1 }
     app=$(yq '.app // ""' $f) port=$(yq '.localPort // ""' $f)
     [[ -n $app && -n $port ]] || { err "${f:t}: faltan 'app' o 'localPort'"; return 1 }
     [[ -z ${seen_port[$port]} ]] || { err "localPort $port repetido en ${f:t} y ${seen_port[$port]}"; return 1 }
     seen_port[$port]=${f:t}
-    while IFS=$'\t' read -r m p; do
-      key="$m $p"
-      [[ -z ${seen_route[$key]} ]] || { err "Ruta duplicada '$key' en ${f:t} y ${seen_route[$key]}"; return 1 }
-      seen_route[$key]=${f:t}
-    done < <(yq '.routes[] | [(.method | upcase), .path] | @tsv' $f)
+  done
+  for key in $sel; do
+    m=${${key#*	}%%	*} p=${key##*	}
+    [[ $p == /* && $p != */ ]] || { err "${key%%	*}: ruta '$p' inválida (debe empezar con / y no terminar en /)"; return 1 }
+    [[ $m == (GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|ANY) ]] || { err "${key%%	*}: método '$m' inválido en $p"; return 1 }
+    local rk="$m $p"
+    [[ -z ${seen_route[$rk]} ]] || { err "Ruta '$rk' repetida en ${key%%	*} y ${seen_route[$rk]}"; return 1 }
+    seen_route[$rk]=${key%%	*}
   done
 
   # 1) Services LoadBalancer para que Floci llegue a cada app por el nodo k3d
-  title "Publicando API Gateway '$API_ID'"
+  title "Publicando API Gateway '$API_ID' (${#sel} rutas de ${#files} archivo(s))"
   local manifest=$CACHE/apigw-services.yaml
   : >$manifest
   for f in $files; do
@@ -437,22 +1138,32 @@ cmd_apigw() {
     print -- --- >>$manifest
   done
   if [[ $DRY_RUN == 1 ]]; then cat $manifest
-  else step "Exponiendo microservicios" kubectl apply -f $manifest || return 1
+  elif cluster_running; then
+    need_cluster && step "Exponiendo microservicios" $K apply -f $manifest || return 1
+    apigw_prune_services $files
+  else
+    warn "k3d está apagado: publico el API, pero las rutas no responderán hasta encenderlo y republicar."
   fi
 
   # 2) API Gateway
-  [[ $DRY_RUN == 1 ]] || aws --profile floci apigateway delete-rest-api --rest-api-id $API_ID >/dev/null 2>&1
-  awsf apigateway create-rest-api --name local-gateway --endpoint-configuration types=REGIONAL \
-    --tags "{\"floci:override-id\":\"$API_ID\"}" --query id >/dev/null || return 1
+  [[ $DRY_RUN == 1 ]] || need_floci || return 1
+  [[ $DRY_RUN == 1 ]] || awsx apigateway delete-rest-api --rest-api-id $API_ID >/dev/null 2>&1
+  local real
+  real=$(awsf apigateway create-rest-api --name local-gateway --endpoint-configuration types=REGIONAL \
+    --tags "{\"floci:override-id\":\"$API_ID\"}" --query id) || return 1
+  [[ $DRY_RUN == 1 ]] && real=$API_ID
+  if [[ $real != ${API_ID_SET:-local} ]]; then
+    warn "El emulador ignoró el ID fijo '${API_ID_SET:-local}' (creó '$real'): la URL cambia en cada publicación."
+  fi
+  API_ID=$real
+  [[ $DRY_RUN == 1 ]] || print -r -- $API_ID >$API_ID_FILE
 
   local -A RES
   local RID
   if [[ $DRY_RUN == 1 ]]; then RES[/]=root
-  else RES[/]=$(aws --profile floci --output text apigateway get-resources --rest-api-id $API_ID --query "items[?path=='/'].id")
+  else RES[/]=$(awsx apigateway get-resources --rest-api-id $API_ID --query "items[?path=='/'].id")
   fi
-
-  # Crea (si falta) cada segmento de la ruta; deja el ID en RID
-  ensure_resource() {   # ojo: no usar "path" como nombre (en zsh es $PATH)
+  ensure_resource() {   # crea (si falta) cada segmento; deja el ID en RID. ojo: no usar "path" (es $PATH)
     local rpath=$1
     if [[ -n ${RES[$rpath]} ]]; then RID=${RES[$rpath]}; return; fi
     local parent=${rpath%/*}; [[ -z $parent ]] && parent=/
@@ -462,12 +1173,12 @@ cmd_apigw() {
     RES[$rpath]=$RID
   }
 
-  local method target seg name; local -a out mparams iparams mextra iextra
+  local method target seg name file; local -a out mparams iparams mextra iextra
   for f in $files; do
-    port=$(yq '.localPort' $f)
+    port=$(yq '.localPort' $f) file=${f:t:r}
     while IFS=$'\t' read -r method p target; do
+      (( ${sel[(Ie)$file	$method	$p]} )) || continue      # solo las rutas activas
       ensure_resource $p
-
       # Parámetros de ruta: {channelId} o {proxy+} → se pasan tal cual al backend
       mparams=() iparams=() mextra=() iextra=()
       for seg in ${(s:/:)p}; do
@@ -480,20 +1191,166 @@ cmd_apigw() {
         mextra=(--request-parameters "{${(j:,:)mparams}}")
         iextra=(--request-parameters "{${(j:,:)iparams}}")
       fi
-
       awsf apigateway put-method --rest-api-id $API_ID --resource-id $RID \
         --http-method $method --authorization-type NONE $mextra >/dev/null || return 1
       awsf apigateway put-integration --rest-api-id $API_ID --resource-id $RID \
         --http-method $method --type HTTP_PROXY --integration-http-method $method \
         --uri "http://$node:$port$target" $iextra >/dev/null || return 1
-
-      out+="$(printf '%-7s %s' $method "$FLOCI/restapis/$API_ID/$STAGE/_user_request_$p")"
+      out+="$(printf '%-7s %s   (%s)' $method "$FLOCI/restapis/$API_ID/$STAGE/_user_request_$p" $file)"
     done < <(yq '.routes[] | [(.method | upcase), .path, (.target // .path)] | @tsv' $f)
   done
 
   awsf apigateway create-deployment --rest-api-id $API_ID --stage-name $STAGE >/dev/null || return 1
-  ok "API Gateway publicado. Rutas:"
+  ok "API Gateway publicado:"
   print -rl -- "  "$^out
+}
+
+# Borra los Services -apigw de apps que ya no tienen rutas activas
+apigw_prune_services() {
+  local -a want=() have f
+  for f in "$@"; do want+="$(yq '(.namespace // "local") + "/" + .app + "-apigw"' $f)"; done
+  have=(${(f)"$($K get svc -A -l dev-scripts/apigw=true -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' 2>/dev/null)"})
+  for f in ${have:|want}; do quiet "Quitar Service $f" $K delete svc -n ${f%%/*} ${f#*/} && dim "  - Service $f"; done
+}
+
+apigw_clear() {
+  [[ $DRY_RUN == 1 ]] && { dim "  (borraría el API $API_ID y los Services -apigw)"; return 0 }
+  : >$ACTIVE
+  floci_up && awsx apigateway delete-rest-api --rest-api-id $API_ID >/dev/null 2>&1 && ok "API Gateway '$API_ID' eliminado"
+  rm -f $API_ID_FILE
+  if cluster_running && need_cluster; then
+    $K delete svc -A -l dev-scripts/apigw=true >/dev/null 2>&1 && dim "  Services -apigw eliminados"
+  fi
+  return 0
+}
+
+# ---- publicar (elegir archivos o rutas)
+cmd_apigw_publish() {
+  local -a files=(${(f)"$(route_files)"})
+  (( $#files )) || { err "No hay archivos de rutas en ${ROUTES_DIR/#$HOME/~} (ver hola-mundo.yaml.example)"; return 1 }
+  check_route_files || return 1
+  local -a all=(${(f)"$(all_routes)"}) act=(${(f)"$(active_routes)"}) new=() f
+  if (( $# )); then                                 # dev apigw publish archivo…: archivos completos
+    for f in "$@"; do
+      f=${${f:t}%.yaml}
+      [[ -f $ROUTES_DIR/$f.yaml ]] || { err "No existe ${ROUTES_DIR/#$HOME/~}/$f.yaml"; return 1 }
+      new+=(${(M)all:#$f	*})
+    done
+  elif [[ ! -t 0 ]]; then
+    new=($act)                                      # sin terminal: republica lo activo
+  else
+    local mode; mode=$(gum choose --header "🌐 ¿Qué publicar?" \
+        "Archivos completos" "Elegir rutas una por una" \
+        ${act:+"Republicar lo activo (${#act} rutas)"} "Cancelar") || return 0
+    case $mode in
+      Archivos*)
+        local -a actf=(${(u)act%%	*}) sel
+        sel=(${(f)"$(gum choose --no-limit --header "Archivos (espacio marca · los marcados quedan activos)" \
+              ${actf:+--selected=${(j:,:)actf}} ${files:t:r})"}) || return 0
+        for f in $sel; do new+=(${(M)all:#$f	*}); done ;;
+      Elegir*)
+        local -a shown=() pre=() l
+        for l in $all; do shown+="$(fmt_route $l)"; (( ${act[(Ie)$l]} )) && pre+="$(fmt_route $l)"; done
+        local sel; sel=$(gum choose --no-limit --height 20 --header "Rutas (espacio marca · las marcadas quedan activas)" \
+              ${pre:+--selected=${(j:,:)pre}} $shown) || return 0
+        for l in ${(f)sel}; do new+="$(unfmt_route $l)"; done ;;
+      Republicar*) new=($act) ;;
+      *) return 0 ;;
+    esac
+  fi
+  if (( ! $#new )); then
+    (( $# )) && { err "Esos archivos no tienen rutas"; return 1 }
+    [[ -t 0 ]] && gum confirm --default=false "No elegiste rutas: ¿quitar todo el API Gateway?" && apigw_clear
+    return 0
+  fi
+  [[ $DRY_RUN == 1 ]] || print -rl -- $new >$ACTIVE
+  [[ $DRY_RUN == 1 ]] && { local ACTIVE=$CACHE/apigw-dry; print -rl -- $new >$ACTIVE }
+  apigw_build
+}
+
+# ---- ver lo publicado (desde Floci) y la selección
+cmd_apigw_ls() {
+  local -a act=(${(f)"$(active_routes)"}) l
+  title "🌐 API Gateway '$API_ID'"
+  if floci_up && awsx apigateway get-rest-api --rest-api-id $API_ID >/dev/null 2>&1; then
+    local js; js=$(awsjx apigateway get-resources --rest-api-id $API_ID 2>/dev/null)
+    local -a rows=(${(f)"$(yq -p=json '.items[] | select(.resourceMethods) | .id as $id | .path as $p | .resourceMethods | keys | .[] | [$p, ., $id] | @tsv' <<<"$js")"})
+    local id m p uri n=0
+    for l in ${(o)rows}; do
+      IFS=$'\t' read -r p m id <<<"$l"
+      uri=$(awsx apigateway get-integration --rest-api-id $API_ID --resource-id $id --http-method $m --query uri 2>/dev/null)
+      printf '  %-7s %-40s → %s\n' $m $p ${uri:-?}
+      (( n++ ))
+    done
+    (( n )) || dim "  (el API existe pero no tiene rutas)"
+    echo; dim "URL base: $FLOCI/restapis/$API_ID/$STAGE/_user_request_/<ruta>"
+  else
+    dim "  No hay API publicado en Floci."
+  fi
+  # diferencias entre la selección guardada y lo publicado (ej. Floci se reinició sin datos)
+  if (( $#act )); then
+    local -A pub; local -a falta=(); local k
+    for l in ${rows:-}; do k="${${l#*	}%%	*} ${l%%	*}"; pub[$k]=1; done       # "MÉTODO ruta"
+    for l in $act; do k="${${l#*	}%%	*} ${l##*	}"; (( ${+pub[$k]} )) || falta+="$(fmt_route $l)"; done
+    (( $#falta )) && { echo; warn "Rutas activas que no están publicadas (republica con: dev apigw publish):"; print -rl -- "    "$^falta }
+  fi
+  local -a files=(${(f)"$(route_files)"})
+  local -a names=(${files:t:r})
+  (( $#names )) && { echo; dim "Archivos en stack/apigw: ${(j:, :)names}" }
+}
+
+# ---- quitar rutas
+cmd_apigw_rm() {
+  local -a act=(${(f)"$(active_routes)"}) keep=() l
+  (( $#act )) || { dim "No hay rutas activas."; return 0 }
+  local mode; mode=$(gum choose --header "🗑  ¿Qué quitar del API? (los archivos no se tocan)" \
+      "Rutas sueltas" "Todas las rutas de un archivo" "Todo el API Gateway" "Cancelar") || return 0
+  case $mode in
+    Rutas*)
+      local sel; sel=$(print -rl -- ${(f)"$(for l in $act; do fmt_route $l; done)"} | \
+            gum filter --no-limit --header "Rutas a quitar (Tab marca)" --placeholder "buscar…") || return 0
+      local -a rm=(); for l in ${(f)sel}; do rm+="$(unfmt_route $l)"; done
+      keep=(${act:|rm}) ;;
+    *archivo*)
+      local -a fs=(${(u)act%%	*}) sel
+      sel=(${(f)"$(gum choose --no-limit --header "Archivos a quitar" $fs)"}) || return 0
+      for l in $act; do (( ${sel[(Ie)${l%%	*}]} )) || keep+=$l; done ;;
+    Todo*)
+      gum confirm --default=false "¿Eliminar el API Gateway completo?" || return 0
+      apigw_clear; return ;;
+    *) return 0 ;;
+  esac
+  print -rl -- $keep >$ACTIVE
+  if (( $#keep )); then apigw_build; else apigw_clear; fi
+}
+
+# dev apigw [publish [archivo…]|ls|rm|clear] — sin argumentos, submenú
+cmd_apigw() {
+  local sub=$1; shift 2>/dev/null
+  case $sub in
+    publish) cmd_apigw_publish "$@" ;;
+    ls)      cmd_apigw_ls ;;
+    rm)      cmd_apigw_rm ;;
+    clear)   apigw_clear ;;
+    "")      [[ -t 0 ]] || { cmd_apigw_publish; return }
+             submenu "🌐 API Gateway" \
+               "👀 Ver rutas publicadas|cmd_apigw_ls" "🚀 Publicar / elegir rutas…|cmd_apigw_publish" \
+               "🗑  Quitar rutas…|cmd_apigw_rm" ;;
+    *) err "Uso: dev apigw [publish [archivo…]|ls|rm|clear]"; return 1 ;;
+  esac
+}
+
+# Submenú: título "texto|función"…  (↩ Volver regresa al menú principal)
+submenu() {
+  local t=$1 c a m; shift
+  local -a items=("$@" "↩  Volver|back")
+  while true; do
+    c=$(gum choose --header "$t" --cursor "➜ " --height 12 ${items%%\|*}) || return 0
+    for m in $items; do [[ ${m%%\|*} == $c ]] && { a=${m##*\|}; break }; done
+    [[ $a == back ]] && return 0
+    $a
+    echo; gum input --placeholder "Enter para continuar" >/dev/null || return 0
+  done
 }
 
 cmd_help() { sed -n '2,/^$/p' $SELF | sed 's/^# \{0,1\}//' }
@@ -514,6 +1371,11 @@ case $1 in
 esac
 
 check_tools docker k3d kubectl yq gum aws curl
+mkdir -p $AWS_DIR $ROUTES_DIR
+# Con Docker apagado solo tiene sentido encender (o el menú, que muestra el estado)
+if [[ -n $1 && $1 != (on|up|off|pause|power|aws|apigw) ]] && ! docker_running; then
+  err "Docker está apagado. Usa: dev on"; exit 1
+fi
 resolve_project || exit 1
 
 if [[ -n $1 ]]; then
@@ -522,22 +1384,24 @@ if [[ -n $1 ]]; then
 fi
 
 MENU=(
-  "🚀 Levantar ambiente|up"
+  "⏻  Encender / apagar|power"
   "📦 Compilar y desplegar app|deploy"
   "📝 Aplicar manifiestos (reinicia pods)|apply"
-  "🌐 Publicar API Gateway|apigw"
+  "☁  Recursos AWS…|aws"
+  "🌐 API Gateway…|apigw"
   "📊 Estado|status"
   "🗂  Resumen de proyectos|overview"
   "📜 Logs|logs"
+  "🩺 Diagnosticar pod|diagnose"
   "🔌 Port-forward|forward"
-  "☁  Ver recursos en Floci|aws"
   "🔀 Cambiar proyecto|project"
   "📄 Ver último log|log"
-  "⏸  Pausar ambiente|pause"
-  "🗑  Eliminar|destroy"
+  "🗑  Eliminar clúster…|destroy"
   "👋 Salir|exit"
 )
 
+# Ctrl+C corta logs/port-forward y vuelve al menú en lugar de cerrar dev
+trap ':' INT
 while true; do
   header
   choice=$(gum choose --cursor "➜ " --height 16 ${MENU%%\|*}) || break
@@ -547,3 +1411,4 @@ while true; do
   echo; gum input --placeholder "Enter para volver al menú" >/dev/null || break
   clear
 done
+

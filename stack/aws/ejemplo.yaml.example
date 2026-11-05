@@ -1,0 +1,32 @@
+# Recursos AWS de un proyecto (dev aws apply). Copia como <proyecto>.yaml
+# (solo se leen los *.yaml). Aplicar crea lo que falta y no toca lo que ya existe.
+# Solo se crean en Floci (simulación local); las cuentas reales usan CloudFormation.
+
+sqs:
+  - name: pagos-eventos
+    dlq: {maxReceiveCount: 3}        # o dlq: true → crea pagos-eventos-dlq y la enlaza
+    visibilityTimeout: 30            # opcional
+  - pagos-comandos.fifo              # forma corta: solo el nombre (.fifo → cola FIFO)
+
+sns:
+  - name: pagos-notificaciones
+    subscriptions:
+      - {protocol: sqs, endpoint: pagos-eventos, raw: true}   # raw: sin el sobre de SNS
+
+dynamodb:
+  - name: pagos
+    key: {pk: S, sk: S}              # la 1ª es partition key (HASH), la 2ª sort key (RANGE) · S | N | B
+    gsi:
+      - {name: por-estado, key: {estado: S}}
+    items:                           # semilla opcional: solo se inserta al crear la tabla
+      - {pk: "cliente#1", sk: "pago#1", estado: PENDIENTE, monto: 25.5}
+
+s3:
+  - pagos-comprobantes
+
+secrets:
+  - name: pagos/db
+    value: {usuario: app, clave: "${DB_PASS}"}   # ${VAR} sale de tu entorno: no escribas claves aquí
+
+ssm:
+  - {name: /pagos/api-url, value: "http://pagos-api:8080", type: String}   # String | SecureString | StringList
